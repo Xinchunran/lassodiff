@@ -1,0 +1,38 @@
+{
+  "checks": {
+    "ca_rmsd_not_worse": true,
+    "clash_not_worse": false,
+    "diagnostic_denominators": true,
+    "exactly_one": false,
+    "finite": true,
+    "frame_valid": true,
+    "intra_residue_backbone": true,
+    "plug_match": false,
+    "rotation_det": true
+  },
+  "decision": "FRAME_V1_1_CHAIN_STITCH_REQUIRED",
+  "diagnostics": {
+    "backbone_valid_rate": 0.0,
+    "ca_lddt": 0.4188090452874029,
+    "ca_rmsd": 5.794533050060272,
+    "clash_valid_rate": 0.06756756756756757,
+    "crossing_exactly_one_rate": 0.4045045045045045,
+    "formed_geometry_valid_rate": 0.015765765765765764,
+    "frame_residue_count": 48825.0,
+    "frame_valid_rate": 1.0,
+    "frame_valid_residue_count": 48825.0,
+    "intra_residue_backbone_valid_rate": 1.0,
+    "intra_residue_frame_count": 48825.0,
+    "intra_residue_valid_count": 48825.0,
+    "peptide_continuity_pair_count": 46605.0,
+    "peptide_continuity_valid_count": 10880.0,
+    "peptide_continuity_valid_rate": 0.23345134642205773,
+    "plug_match_rate": 0.22072072072072071,
+    "rotation_det_error": 2.1606119119748663e-07,
+    "rotation_det_error_sum": 0.010549187660217285,
+    "rotation_det_frame_count": 48825.0,
+    "strict_valid_rate": 0.0,
+    "tail_persistence_rate": 0.33603603603603605
+  },
+  "observed_step": 100
+}
