@@ -1,159 +1,133 @@
-# LassoDiff v3.2.0
+# LassoDiff Mini
 
-LassoDiff 是面向套索肽（lasso peptide）的 sequence screening、candidate-specific topology reasoning 与三维结构生成仓库。当前唯一开发主线是 `lassodiff_opendde_v3`：冻结 OpenDDE residue reasoning，并分别服务于 sequence-level `LASSO / NON_LASSO / ABSTAIN` 判别与 candidate-specific geometry-aware diffusion。V1/toy 路径已退役；V2 只作为冻结的历史 baseline，不再作为开发入口。
-
-文档版本：3.2.0
-
-更新日期：2026-08-01
-
-V3 状态：Implementation contract / test-first runbook
-
-## Agent 启动协议（MUST）
-
-任何 agent 在每次开始本仓库任务时，必须先完整阅读本 README，再执行读取状态以外的命令或修改。涉及 V3 reasoning、训练、筛选或评估时，还必须按顺序阅读：
-
-1. [`reasoning.md`](reasoning.md)：OpenDDE reasoning 架构、禁止项、阶段与测试合同；
-2. [`metrics.md`](metrics.md)：sequence/structure 指标定义、数据切分与 release gate；
-3. [`scoring.md`](scoring.md)：authoritative threading checker、可微 surrogate 与 candidate scoring 合同；
-4. [`lasso_instruction/plan.md`](lasso_instruction/plan.md)、[`debug.md`](lasso_instruction/debug.md)、[`tests.md`](lasso_instruction/tests.md)：当前执行状态与历史证据。
-
-不得仅凭类名、配置、日志字符串或 state dict 宣称功能完成。所有 `MUST` 均需 route、output-dependence、gradient、optimizer、checkpoint manifest 和 behavioral test 证据。OpenDDE checkpoint/commit/schema 不匹配时必须 fail closed，禁止回退 ESM-only、legacy Pairformer 或旧 score head。
-
-仓库根目录 [`AGENTS.md`](AGENTS.md) 同步声明该协议，供自动化 agent loader 强制执行。
-
-## 当前状态
-
-| 路径 | 状态 | 说明 |
-|---|---|---|
-| V2 medium baseline | 已冻结 | 20,000 step artifact 保留用于历史比较；源码入口不再属于开发主线 |
-| V2 small baseline | 已冻结 | step 1,620 停止，checkpoint/log 保留 |
-| OpenDDE V3 velocity-only baseline | 20,000 step 已完成、判定失败 | strict topology pass 始终 0；artifact 全部保留，不作为 release model |
-| OpenDDE V3 topology-loss 2k | 历史诊断完成 | exit 0；旧 checker 错看 pre-plug `k+1..p`，旧 loss 又跳过决定性的 `p→p+1`，两者均未表达 plug-to-tail threading；该 run 不再续训 |
-| V3.2 threading alignment | 代码与离线数据审计通过 | checker/surrogate 共享非平面 centroid-fan surface 与 `p..tail` thread；6,211/6,433（96.55%）真实 targets 恰好一次 crossing；新 2k pilot 尚未运行 |
-| V3.2 startup gate | PASS | real preflight、cache manifest、topology/Hamming split、6,433-target alignment report 已通过 hash/provenance 校验；可启动新 2k pilot |
-
-历史 V2 medium artifact 位于 [`runs/lassodiff-v2-medium-20260801/`](runs/lassodiff-v2-medium-20260801/)，只用于结果追溯，不再提供 V2 训练入口。
-
-V3 medium 状态位于 [`runs/lassodiff-v3-structure-medium-20260801/`](runs/lassodiff-v3-structure-medium-20260801/)。`launcher.log`、`metrics.jsonl`、`train_status.json`、config/preflight/cache/split/source manifests 与每 500-step FSDP checkpoints 均保存在该目录。
-
-修复后的 2,000-step 任务位于 [`runs/lassodiff-v3-topology-2k-20260801/`](runs/lassodiff-v3-topology-2k-20260801/)，已成功结束并保存 checkpoint-250 到 checkpoint-2000 及 final。V3 structure target 只使用 chemistry-qualified candidate labels：优先同 rank 的有效 `relaxN`，没有 relax 时才使用通过闭环化学检查的 `minN`；无可靠 target 的 candidate 显式 mask，禁止把开环模板当闭环监督。
-
-源码范围已经收敛到 V3：V1/toy/legacy DDP 与 V2 专属模型、训练入口、配置和专属测试已删除。历史 run artifacts 不删除；V3 仍依赖的通用 candidate/data/geometry/evaluation 数学组件保留。
-
-## V3 总体数据流
+`mini_dev` 是不依赖同源模板、OpenDDE 权重或全原子高斯初始化的小模型开发线。它直接替代旧的“template + classifier 选择 iso/plug”生成路径：
 
 ```text
-Sequence
-  -> frozen OpenDDE residue reasoning -> s_res [B,L,Cs], z_res [B,L,L,Cz]
-       |-> candidate-independent sequence gate -> LASSO / NON_LASSO / ABSTAIN
-       `-> reasoning adapter -> candidate topology(k_j,p_j,acceptor_j)
-            -> lasso structural tokens -> per-block dynamic geometry diffusion
-            -> candidate structures -> strict topology checker
+sequence + candidate(k,p)
+  -> programmatic peptide prior
+  -> core-7 equivariant diffusion
+  -> rotamer/chi sidechain builder
+  -> bounded 4-layer all-heavy-atom refiner
+  -> strict chemistry/topology checker
 ```
 
-核心边界：sequence gate 的 API 不得接收 `k/p/acceptor/ring/plug/closure edge`；screening 不运行 diffusion、不做 hard projection/guidance；结构路径必须依赖 OpenDDE `pair` state，并为每个 candidate 使用独立坐标、atom mask 和 target。
+当前版本：`4.0.0-mini.1`。架构 preflight 与 mini 单测已通过；仓库尚未提供训练完成的 mini checkpoint，因此不能把程序化 seed 或随机权重输出称为已训练生成结果。
 
-## 数据与当前结构表示
+## 开发边界
 
-- 原始 metadata：`${LASSOPRED_ROOT}/lassopred.data.json`
-- 原始 MD/template PDB：仓库 `structure/<LP_ID>/min[1-3].pdb|relax[1-3].pdb`
-- LMDB：`data/lassopred.lmdb`，4,029 records
-- ESM-2 650M cache：`data/esm2_t33_650M_UR50D.lmdb`，3,122 unique sequences
-- V3 topology/Hamming split v4：3,216 / 410 / 403；3,122 unique sequences、1,453 neighbour clusters；结构训练经 `topology_valid` 过滤后为 2,674 / 339 / 353
-- Split 先以等长 normalized Hamming、变长 LCS distance 做 single-linkage 隔离，再按 acceptor/ring length/candidate count/plug-gap topology strata 做 group allocation。Bootstrap 不用于构造 split；它只用于 locked test 上的 paired confidence interval。
+- Mini 的唯一坐标 schema 是 `N/CA/C/O/CB/CISO/OISO`。
+- `ASP_ISO` 使用 `CISO=CG, OISO=OD1`；`GLU_ISO` 使用 `CISO=CD, OISO=OE1`。
+- formed acceptor 只有一个 carbonyl oxygen；不存在的 atom 必须由 mask 表示，禁止用零坐标冒充。
+- 每个 `(sequence,k,p,target-rank)` 是独立训练样本；非法 candidate 直接失败，不做 `clamp()`。
+- prior 只使用 sequence、`k/p` 和通用肽链几何，不读取模板坐标。
+- screening 固定使用 open-chain prior，并关闭 projection/topology guidance。
+- strict checker 是最终真值；construction 成功率不能替代 sequence feasibility。
 
-`Upper_Plug_1/2/3` 定义 candidate rank 1/2/3；`min1/relax1`、`min2/relax2`、`min3/relax3` 分别只监督同 rank candidate。它们当前不是“同一 topology 的三个无条件 conformation”。候选维 `M` 在 candidate objective 前不得消失；若要生成同 candidate 的构象 ensemble，应固定 candidate 后使用多个 diffusion noise seeds。
+原 OpenDDE V3 文件目前只作为历史/活跃实验兼容代码保留，不再是本分支默认入口。README 记录的 V3.3 任务在分叉时仍有活跃 run，因此本次没有删除或移动它可能继续使用的源码、配置、日志和 checkpoint。待该 run 结束后可以单独清理 legacy 文件。
 
-当前不是全原子生成：坐标 schema 是每个 residue 的 `N/CA/C/O`，加 acceptor residue 的 `Ciso/O1`。因此 clash 只能称为 sparse-heavy-atom clash，不能据此宣称全原子物理有效。
+## 环境与首次检查
 
-## 下一轮 TODO（按执行顺序）
-
-- [ ] 与数据来源再次签署 `Upper_Plug_N` 和 `minN/relaxN` 的 candidate/conformation 语义；在 manifest 中冻结，不凭文件名继续推断。
-- [x] 在已统一的 `p..tail` 非平面 surface 定义上补齐 checker 的 plug retention、tail clearance、扰动稳定性字段；
-- [ ] 补全 wrong-plug、double-crossing、边界和 closure-convention 版本化 decoy truth set。
-- [x] 移除错段 checker/旧 Gauss-link training loss，接入与 checker 共用几何对象的 differentiable signed-crossing surrogate；真实 target hard-check 一致率 96.55%。
-- [ ] 完成 surrogate AUROC/AUPRC/rank correlation、synthetic overfit、behavioral ablation 和新 2,000-step rollout；未通过前仍不启动长训练。
-- [x] 将 checker hard validity 与各组成项接入 candidate scoring；日志保留 rejection reason、geometry/clash/threading 组件，且不回写 sequence classification。
-- [ ] 在 locked validation 上校准 scoring 权重与 hard thresholds。
-- [ ] 完善 sparse-heavy-atom clash 与主链分布报告：any-clash、minimum distance、bond/angle/dihedral、planarity、Ramachandran、分位数和分层统计。
-- [x] 结构数据落地 topology/Hamming group-stratified split v4，并由 cluster/topology/hash fail-closed tests 约束。
-- [x] `build_sequence_gate_dataset.py` 移除随机 group shuffle，改为 source/family + Hamming/LCS neighbour hard grouping，并联合分层 positive topology 与 negative kind/OOD strata。
-- [ ] 构建 verified lasso-positive manifest 与 background/composition-shuffle/hard-mutant/verified wrong-topology sequence controls/random-OOD negatives；sequence gate split 复用相同 neighbour isolation，并额外绑定 mutant/source group。仅给同一 sequence 换错误 `k/p` 不是 sequence negative，只能监督 candidate hypothesis/structure。
-- [ ] 在完全相同 split 上做 `OpenDDE gate`、`frozen ESM-2 gate`、`OpenDDE+ESM fusion` 三路 ablation；第一轮两个 pretrained trunks 均冻结，只训练小型 adapter/head。
-- [ ] 在 negatives、FPR/calibration 与 leave-family-out 证据完成前，不启动 sequence joint training，不把 3,122 条 LassoPred 序列全部冒充 verified positives。
-- [ ] 锁定 checkpoint-1500/2000、相同 candidate/seeds/sampler steps，完成 paired bootstrap 的 structure release comparison。
-- [ ] threading/scoring 稳定后再单独决定是否从 sparse 7-slot 升级 atom14/atom37；禁止与 surrogate 重构同时改动。
-- [ ] 将仍被 V3 复用但历史命名带 `v2` 的通用评估函数重命名为版本中性模块，并保持 checkpoint/metric schema provenance。
-
-## OpenDDE 固定版本
-
-本地运行前需将 OpenDDE runtime 根目录通过环境变量注入，仓库不保存个人机器路径：
+每次任务仍须先完整阅读本 README。不要下载数据、启动训练或控制进程，直到 startup preflight 通过。
 
 ```bash
-export OPENDDE_RUNTIME_ROOT=/path/to/opendde_data
+python -m scripts.verify_mini_startup \
+  --output artifacts/mini/preflight.json
+
+python -m pytest tests/mini -q
 ```
 
-- 官方仓库：<https://github.com/aurekaresearch/OpenDDE>
-- 审计并固定 commit：`f607bb3c9ff299c0627ac20f5ef8e25d716ed46f`
-- 本机 checkpoint：`opendde.pt`
-- checkpoint SHA-256：`7b826620390afad877ee2babc6a4d0df81b94d3a0be030959853d6a7da0807cc`
-- 许可证：Apache-2.0；复制/修改源码必须保留 SPDX/header 并记录本地修改
+preflight 会行为验证：ASX 单氧 chemistry、无模板 prior、0/1/2 crossing fixtures、current-coordinate dependence、screening 无 projection/guidance、侧链完整性和 refiner 最大位移。任一失败都不得训练。
 
-OpenDDE 是 preview，公开 CLI 不保证暴露稳定的中间 reasoning state。V3 必须在固定 fork 中提供版本化 `forward_reasoning()`，不得依赖 floating `main`、匿名 module index 或静默 hook fallback。
+## 数据
 
-## 常用命令
+Mini 不读取旧 schema-1 LMDB 的 7 槽坐标，因为该 LMDB 是 `N/CA/C/O/CISO/O1/O2`，与新 core-7 不兼容。训练时从原始 metadata 与 rank-matched PDB 重新解析：
 
-V3 非 release tests：
+```text
+Upper_Plug_1 <-> relax1/min1
+Upper_Plug_2 <-> relax2/min2
+Upper_Plug_3 <-> relax3/min3
+```
+
+同 rank 优先 `relaxN`，缺失时使用 `minN`。PDB 会去氢、规范化 `ASX/GLX`、生成 core/Atom14 mask，并保持 candidate 维度。
+
+## 训练
+
+下面是小规模开发训练；它不会自动下载数据或停止现有任务：
 
 ```bash
-python -m pytest \
-  tests/data tests/unit tests/contracts tests/integration -q --maxfail=1
+python -m scripts.train_mini \
+  --metadata /path/to/lassopred.data.json \
+  --structure-root /path/to/structure \
+  --preflight artifacts/mini/preflight.json \
+  --run-dir runs/lassodiff-mini-dev \
+  --batch-size 4 \
+  --steps 1000
 ```
 
-已完成 topology-loss run：
+默认 prior 比例：
+
+```yaml
+open_chain: 0.40
+single_crossing: 0.40
+topology_corrupted: 0.20
+```
+
+训练目标分成三段：core flow + peptide/iso/clash/exactly-one；rotamer/χ 驱动的 Atom14 坐标；最大位移受限的 all-heavy refiner。coordinate-free viability head 同时使用正确 candidate 与 wrong-plug hard negative，checkpoint 必须严格加载全部四个模块。
+
+## Construction
+
+`k/p` 均为 zero-based。需要已训练 checkpoint：
 
 ```bash
-jq -c 'select(.split=="validation_rollout" or .event=="complete")' \
-  runs/lassodiff-v3-topology-2k-20260801/metrics.jsonl
+python -m scripts.run_mini construction \
+  --checkpoint runs/lassodiff-mini-dev/checkpoint-final.pt \
+  --sequence LLQRNGRDRLILSKN --k 7 --p 9 \
+  --samples 8 --steps 40 \
+  --output candidate.pdb
 ```
 
-V3 的训练命令在 `reasoning.md` 所列 P0--P6 门禁和 V3 preflight 全部通过前不得运行。
+Construction 默认 single-crossing procedural seed。所有样本仍必须经过 strict checker；若没有 strict-valid 样本，JSON 会保留逐项 rejection reason，不会把“生成了坐标”写成成功。
 
-V3 全量 reasoning cache（当前由同名 systemd user service 持久运行）：
+## Screening
 
 ```bash
-torchrun --standalone --nproc_per_node=4 \
-  scripts/cache_opendde_reasoning.py \
-  --config configs/lassodiff_opendde_v3.yaml \
-  --dataset data/lassopred.lmdb \
-  --log-dir runs/lassodiff-v3-opendde-cache-20260801 --device cuda
+python -m scripts.run_mini screening \
+  --checkpoint runs/lassodiff-mini-dev/checkpoint-final.pt \
+  --sequence LLQRNGRDRLILSKN --k 7 --p 9 \
+  --samples 16 --steps 40
 ```
 
-V3 正式 structure phase 固定为 4-rank FSDP、每卡 batch 16、global batch 64；入口会拒绝 cache miss、旧 record split 和未记录真实 reasoner route 的 preflight：
+Screening 强制 open-chain prior，且输出：
 
-```bash
-torchrun --standalone --nproc_per_node=4 \
-  scripts/train_structure_v3.py \
-  --config configs/lassodiff_opendde_v3.yaml \
-  --dataset data/lassopred.lmdb \
-  --split data/lassopred.lmdb/split_topology_hamming_v4.json \
-  --preflight artifacts/v3/preflight.real.json \
-  --cache-manifest artifacts/v3/cache_manifest.json \
-  --threading-report artifacts/v3/threading_alignment_v3.json \
-  --startup-gate artifacts/v3/startup_gate_v3.json \
-  --run-dir runs/lassodiff-v3-structure-medium-20260801 \
-  --batch-size 16 --max-steps 20000
+```text
+candidate_viability
+unassisted_valid_rate
+candidate_score = candidate_viability * unassisted_valid_rate
 ```
 
-Sequence gate 和 joint trainer 已提供，但只有在 verified lasso positive 与版本化 background/hard-negative manifest 就绪后才允许启动。LassoPred candidate/MD template 只能监督候选结构，不能被当成 sequence positive 标签。
+它不会使用 hard iso projection、topology projection 或强 topology guidance。第一版判别应解释为 `LASSO / UNSUPPORTED / ABSTAIN`，在真实 non-lasso 校准集完成前不要宣称绝对 `NON-LASSO`。
 
-## 版本政策
+## Validation 与 release gate
 
-- `VERSION` 是仓库文档/架构主版本；当前为 `3.2.0`。
-- V2 checkpoint manifest 的 schema 保持 2；V3 使用 `architecture_id=lassodiff_opendde_v3`、schema 3。
-- V1/V2 checkpoint 不得通过 `strict=False` 直接加载到 V3。
-- config、source commit、OpenDDE commit/checkpoint SHA、feature schema、split manifest 和 metrics schema 必须一同归档。
+现有多维 validation 指标继续保留：formed-amide distance/angles/plane、backbone bonds、exact crossing count、plug match、tail persistence、clash、RMSD/lDDT、sampler finite rate，以及按 candidate/length/acceptor 分层的统计。Mini 在 `lassodiff.validation.threading_mini` 独立实现 full-tail hard/soft 几何，聚合入口是 `lassodiff.validation.strict_lasso`；它不依赖工作区未提交的 V3 checker 改动。
 
-## Acknowledgements
+Construction 与 screening 必须分别报告，所有记录至少携带 checkpoint、seed、candidate mapping、prior mode、sampler steps、projection/guidance flags 和 sample count。release 前仍需 locked validation、hard-negative calibration 与 paired comparison；训练 loss 下降不构成完成证据。
 
-LassoDiff 参考并复用 Protenix、ml-simplefold 与 OpenDDE 的公开工程和建模思想。OpenDDE 来源代码受 Apache-2.0 约束；任何 vendored/modified code 必须保留原始许可声明。
+## 主要文件
+
+```text
+lassodiff/atom_schema_lasso.py       core-7、candidate、共价图
+lassodiff/structure_processor.py     ASX/GLX 与 PDB 规范化
+lassodiff/internal_coordinates.py    无模板 internal-coordinate builder
+lassodiff/peptide_prior.py           open/single/corrupted priors
+lassodiff/model_mini.py              core diffusion
+lassodiff/sidechain_builder.py       Atom14、rotamer/chi
+lassodiff/atom_refiner.py            bounded all-heavy refiner
+lassodiff/candidate_viability.py     coordinate-free viability
+lassodiff/validation/strict_lasso.py strict truth checker
+scripts/verify_mini_startup.py       训练前门禁
+scripts/train_mini.py                三段训练
+scripts/run_mini.py                  construction/screening
+configs/lassodiff_mini.yaml          默认合同
+tests/mini/                          mini correctness tests
+```

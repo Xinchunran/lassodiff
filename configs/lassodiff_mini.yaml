@@ -1,0 +1,25 @@
+architecture_id: lassodiff_mini_core7
+schema_version: 1
+core_atoms: [N, CA, C, O, CB, CISO, OISO]
+model:
+  hidden_dim: 128
+  diffusion_blocks: 4
+  refiner_blocks: 4
+  max_refiner_displacement: 0.75
+peptide_prior:
+  open_chain: 0.40
+  single_crossing: 0.40
+  topology_corrupted: 0.20
+inference:
+  construction:
+    prior: single_crossing
+    projection: optional_local_only
+    samples: 8
+  screening:
+    prior: open_chain
+    projection: false
+    topology_guidance: false
+validation:
+  authoritative: lassodiff.validation.strict_lasso
+  require_exactly_one_crossing: true
+  require_plug_match: true
