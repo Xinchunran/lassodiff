@@ -15,6 +15,13 @@ training:
   steps: 20000
   log_every: 10
   save_every: 500
+  validate_every: 500
+data:
+  source_split: data/lassopred.lmdb/split_topology_hamming_v4.json
+  cv_split: data/mini_cv5_locked_test_v1.json
+  split_method: locked_v3_test_topology_stratified_cluster_5fold_v1
+  folds: 5
+  locked_test: true
 peptide_prior:
   open_chain: 0.40
   single_crossing: 0.40

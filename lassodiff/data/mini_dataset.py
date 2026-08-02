@@ -21,6 +21,7 @@ class MiniLassoDataset(Dataset):
     def __init__(self, metadata_json: str | Path, structure_root: str | Path, record_ids=None):
         rows = json.loads(Path(metadata_json).read_text(encoding="utf-8"))
         allowed = None if record_ids is None else set(record_ids)
+        self.requested_record_ids = None if allowed is None else tuple(sorted(allowed))
         examples: list[dict[str, Any]] = []
         rejections: list[dict[str, Any]] = []
         for row in rows:
@@ -57,6 +58,10 @@ class MiniLassoDataset(Dataset):
             raise ValueError("Mini dataset contains no candidate-specific examples")
         self.examples = examples
         self.rejections = rejections
+        self.qualified_record_ids = tuple(sorted({item["record_id"] for item in examples}))
+        self.missing_record_ids = tuple(
+            sorted(allowed - set(self.qualified_record_ids)) if allowed is not None else (),
+        )
         mapping = [
             {
                 "record_id": item["record_id"], "rank": item["rank"],

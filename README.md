@@ -31,6 +31,8 @@ sequence + candidate(k,p)
 
 ```bash
 python -m scripts.verify_mini_startup \
+  --source-split data/lassopred.lmdb/split_topology_hamming_v4.json \
+  --cv-split data/mini_cv5_locked_test_v1.json \
   --output artifacts/mini/preflight.json
 
 python -m pytest tests/mini -q
@@ -50,6 +52,17 @@ Upper_Plug_3 <-> relax3/min3
 
 同 rank 先验证 `relaxN`，缺失或非有限/化学不合格时再验证 `minN`；两者都失败的 example 显式计入 rejection，不会在训练中途随机报错。PDB 会去氢、规范化 `ASX/GLX`、生成 core/Atom14 mask，并保持 candidate 维度。所有 rank 必须得到相同的 qualified count、rejection count 与 mapping SHA-256，否则 FSDP 在创建 run 目录前失败。
 
+数据拆分继承 V3 的 topology/Hamming/LCS neighbour-cluster 合同。V3 的 403-record test 集合永久 hold out，不参与训练、交叉验证或 early stopping；原 train+validation 合并为 development pool，以完整 neighbour cluster 为单位做 topology-stratified 5-fold。每个 development record 恰好作为一次 validation，同一 sequence/近邻 cluster 的全部 candidates 不得跨 fold。当前 Mini PDB 映射缺少的 7 个 source records 保留原归属并在 manifest 中显式标记，禁止通过移动 test 或拆 cluster 补齐比例。锁定 manifest 是 `data/mini_cv5_locked_test_v1.json`。
+
+需要重建该 manifest 时必须从锁定 V3 split 和当前 Mini PDB 映射生成，不得手工编辑：
+
+```bash
+python -m scripts.build_mini_cv_split \
+  --source-split data/lassopred.lmdb/split_topology_hamming_v4.json \
+  --metadata /path/to/lassopred.data.json --structure-root /path/to/structure \
+  --output data/mini_cv5_locked_test_v1.json --seed 17
+```
+
 ## 训练
 
 正式训练使用单机 4-GPU FSDP full-shard；`--batch-size` 是每卡 batch，下面的 global batch 为 16。它不会自动下载数据或停止现有任务：
@@ -61,10 +74,25 @@ Upper_Plug_3 <-> relax3/min3
   --metadata /path/to/lassopred.data.json \
   --structure-root /path/to/structure \
   --preflight artifacts/mini/preflight.json \
-  --run-dir runs/lassodiff-mini-dev \
+  --split data/mini_cv5_locked_test_v1.json \
+  --source-split data/lassopred.lmdb/split_topology_hamming_v4.json \
+  --fold 0 --run-dir runs/lassodiff-mini-cv/fold-0 \
   --batch-size 4 \
-  --steps 20000 --log-every 10 --save-every 500
+  --steps 20000 --log-every 10 --save-every 500 --validate-every 500
 ```
+
+正式 5-fold 训练由顺序 launcher 在同一组 4 GPU 上逐 fold 执行，避免五个模型争抢显存：
+
+```bash
+python -m scripts.train_mini_cv \
+  --metadata /path/to/lassopred.data.json --structure-root /path/to/structure \
+  --preflight artifacts/mini/preflight.json \
+  --split data/mini_cv5_locked_test_v1.json \
+  --source-split data/lassopred.lmdb/split_topology_hamming_v4.json \
+  --run-root runs/lassodiff-mini-cv5 --steps 20000
+```
+
+每个 fold 都使用其余四 folds 训练并在唯一 held-out fold 上记录 validation loss；test 不会被 loader 打开。split/source hash、fold、train/validation mapping hash 与 unavailable records 都进入 run manifest、每条 metrics 和 checkpoint provenance。
 
 FSDP 用一个统一 root 覆盖 core diffusion、sidechain、refiner 和 viability，并使用 `DistributedSampler` 与每-rank 独立 prior/noise seed。Full model/optimizer checkpoint 由所有 rank collective 汇集、仅 rank 0 写盘；日志和 status 也只有 rank 0 写。非空 run directory 会 fail closed，禁止多 rank 争写或覆盖历史任务。
 
@@ -129,8 +157,11 @@ lassodiff/sidechain_builder.py       Atom14、rotamer/chi
 lassodiff/atom_refiner.py            bounded all-heavy refiner
 lassodiff/candidate_viability.py     coordinate-free viability
 lassodiff/validation/strict_lasso.py strict truth checker
+lassodiff/data/mini_split.py         locked-test cluster 5-fold 合同
+scripts/build_mini_cv_split.py       构建并审计 CV manifest
 scripts/verify_mini_startup.py       训练前门禁
 scripts/train_mini.py                三段训练
+scripts/train_mini_cv.py             顺序执行 5 个四卡 folds
 scripts/run_mini.py                  construction/screening
 configs/lassodiff_mini.yaml          默认合同
 tests/mini/                          mini correctness tests

@@ -12,6 +12,7 @@ import torch
 from lassodiff.atom_refiner import MiniAtomRefiner
 from lassodiff.atom_schema_lasso import ATOM_CA, CandidateCondition, MINI_SCHEMA_VERSION
 from lassodiff.candidate_viability import CandidateViabilityHead
+from lassodiff.data.mini_split import validate_mini_cv_manifest
 from lassodiff.model_mini import ARCHITECTURE_ID_MINI, MiniCoreDiffusion
 from lassodiff.peptide_prior import sample_peptide_prior
 from lassodiff.sampler_mini import sample_mini
@@ -27,7 +28,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", required=True)
     parser.add_argument("--min1", default="structure/LP_WP_069782233/min1.pdb")
+    parser.add_argument("--cv-split", required=True)
+    parser.add_argument("--source-split", required=True)
     args = parser.parse_args()
+    source_split = json.loads(Path(args.source_split).read_text(encoding="utf-8"))
+    cv_split = json.loads(Path(args.cv_split).read_text(encoding="utf-8"))
+    validate_mini_cv_manifest(cv_split, source_split)
     torch.manual_seed(7)
     candidate = CandidateCondition("LLQRNGRDRLILSKN", 7, 9)
     generator = torch.Generator().manual_seed(11)
@@ -97,6 +103,10 @@ def main():
         "distributed_backend": "fsdp_full_shard",
         "fsdp_root_modules": [prefix[:-1] for prefix in required_prefixes],
         "fsdp_full_state_checkpoint": True,
+        "cv_split_manifest_sha256": cv_split["manifest_sha256"],
+        "source_split_manifest_sha256": source_split["manifest_sha256"],
+        "cv_fold_count": cv_split["fold_count"],
+        "locked_test_record_count": cv_split["locked_test_record_count"],
         "chemistry_fixture": chemistry,
     }
     path = Path(args.output)

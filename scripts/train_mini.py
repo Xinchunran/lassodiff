@@ -24,12 +24,13 @@ from torch.distributed.fsdp import (
 from torch.utils.data import DataLoader, DistributedSampler
 
 from lassodiff.data.mini_dataset import MiniLassoDataset, collate_mini
+from lassodiff.data.mini_split import select_mini_cv_fold, validate_mini_cv_manifest
 from lassodiff.model_mini import ARCHITECTURE_ID_MINI
 from lassodiff.peptide_prior import sample_peptide_prior, sample_prior_mode
 from lassodiff.training_mini import MiniTrainingSystem
 
 
-def _require_preflight(path: Path):
+def _require_preflight(path: Path, cv_split: dict, source_split: dict):
     report = json.loads(path.read_text(encoding="utf-8"))
     if report.get("status") != "PASS" or report.get("architecture_id") != ARCHITECTURE_ID_MINI:
         raise RuntimeError("Mini training requires a matching PASS preflight")
@@ -37,6 +38,16 @@ def _require_preflight(path: Path):
         raise RuntimeError("Mini preflight violates template/screening contract")
     if report.get("distributed_backend") != "fsdp_full_shard" or report.get("fsdp_full_state_checkpoint") is not True:
         raise RuntimeError("Mini preflight does not authorize FSDP full-state training")
+    expected_split = (
+        cv_split.get("manifest_sha256"), source_split.get("manifest_sha256"),
+        cv_split.get("fold_count"), cv_split.get("locked_test_record_count"),
+    )
+    reported_split = (
+        report.get("cv_split_manifest_sha256"), report.get("source_split_manifest_sha256"),
+        report.get("cv_fold_count"), report.get("locked_test_record_count"),
+    )
+    if reported_split != expected_split:
+        raise RuntimeError("Mini preflight does not match the locked cross-validation split")
     return report
 
 
@@ -92,11 +103,69 @@ def _write_json(path: Path, payload):
     path.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n", encoding="utf-8")
 
 
+def _forward_batch(system, batch, *, device, generator, rank, step, phase):
+    B = batch["core"].shape[0]
+    x0 = torch.zeros_like(batch["core"])
+    for b, condition in enumerate(batch["conditions"]):
+        mode = sample_prior_mode(generator)
+        try:
+            prior = sample_peptide_prior(condition, mode=mode, generator=generator)
+        except Exception as exc:
+            raise RuntimeError(
+                "procedural prior failed for "
+                f"phase={phase}, rank={rank}, step={step}, batch_index={b}, mode={mode}, "
+                f"sequence={condition.sequence}, k={condition.k}, p={condition.p}"
+            ) from exc
+        x0[b, 0, :len(condition.sequence)] = prior.coordinates
+    aa_ids = batch["aa_ids"].to(device, non_blocking=True)
+    token_mask = batch["token_mask"].to(device, non_blocking=True)
+    target = batch["core"].to(device, non_blocking=True)
+    core_mask = batch["core_mask"].to(device, non_blocking=True)
+    t = torch.rand((B,), generator=generator).to(device).clamp(.02, .98)
+    output = system(
+        aa_ids=aa_ids, token_mask=token_mask, target=target, core_mask=core_mask,
+        target14=batch["atom14"].to(device, non_blocking=True),
+        target14_mask=batch["atom14_mask"].to(device, non_blocking=True),
+        k=batch["k"].to(device, non_blocking=True), p=batch["p"].to(device, non_blocking=True),
+        acceptor_type=batch["acceptor_type"].to(device, non_blocking=True),
+        conditions=batch["conditions"], x0=x0.to(device, non_blocking=True), t=t,
+    )
+    return output, B
+
+
+def _validate(system, loader, *, device, rank, world_size, seed, fold, step, max_batches):
+    generator = torch.Generator().manual_seed(seed + 700001 + fold * 1009 + rank * 100003)
+    totals = torch.zeros(6, device=device, dtype=torch.float64)
+    system.eval()
+    with torch.no_grad():
+        for batch_index, batch in enumerate(loader):
+            if max_batches and batch_index >= max_batches:
+                break
+            output, batch_size = _forward_batch(
+                system, batch, device=device, generator=generator, rank=rank,
+                step=step, phase="validation",
+            )
+            values = (output.total, output.core, output.sidechain, output.refine, output.viability)
+            if not all(bool(torch.isfinite(value.detach())) for value in values):
+                raise RuntimeError("non-finite Mini validation loss")
+            totals[:5] += torch.stack([value.detach().double() for value in values]) * batch_size
+            totals[5] += batch_size
+    if world_size > 1:
+        dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+    system.train()
+    if totals[5] <= 0:
+        raise RuntimeError("Mini validation evaluated zero examples")
+    return [float(value / totals[5]) for value in totals[:5]], int(totals[5])
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--metadata", required=True)
     parser.add_argument("--structure-root", required=True)
     parser.add_argument("--preflight", required=True)
+    parser.add_argument("--split", required=True)
+    parser.add_argument("--source-split", required=True)
+    parser.add_argument("--fold", type=int, required=True)
     parser.add_argument("--run-dir", required=True)
     parser.add_argument("--steps", type=int, default=1000)
     parser.add_argument("--batch-size", type=int, default=4)
@@ -105,10 +174,18 @@ def main():
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--save-every", type=int, default=500)
+    parser.add_argument("--validate-every", type=int, default=500)
+    parser.add_argument("--validation-max-batches", type=int, default=0)
     args = parser.parse_args()
-    if args.steps < 1 or args.batch_size < 1 or args.log_every < 1 or args.save_every < 1:
-        raise ValueError("steps, batch-size, log-every and save-every must be positive")
-    report = _require_preflight(Path(args.preflight))
+    if min(args.steps, args.batch_size, args.log_every, args.save_every, args.validate_every) < 1:
+        raise ValueError("steps, batch-size, log/save/validate intervals must be positive")
+    if args.validation_max_batches < 0:
+        raise ValueError("validation-max-batches must be non-negative")
+    source_split = json.loads(Path(args.source_split).read_text(encoding="utf-8"))
+    cv_split = json.loads(Path(args.split).read_text(encoding="utf-8"))
+    validate_mini_cv_manifest(cv_split, source_split)
+    selected_fold = select_mini_cv_fold(cv_split, args.fold)
+    report = _require_preflight(Path(args.preflight), cv_split, source_split)
     source_commit = subprocess.check_output(
         ["git", "rev-parse", "HEAD"], cwd=Path(__file__).resolve().parents[1], text=True,
     ).strip()
@@ -119,12 +196,28 @@ def main():
     torch.manual_seed(args.seed + rank * 100003)
     if device.type == "cuda":
         torch.cuda.manual_seed_all(args.seed + rank * 100003)
-    dataset = MiniLassoDataset(args.metadata, args.structure_root)
+    dataset = MiniLassoDataset(args.metadata, args.structure_root, record_ids=selected_fold["train"])
+    validation_dataset = MiniLassoDataset(
+        args.metadata, args.structure_root, record_ids=selected_fold["val"],
+    )
+    unavailable = set(cv_split["unavailable_record_ids"])
+    expected_train_missing = unavailable & set(selected_fold["train"])
+    expected_validation_missing = unavailable & set(selected_fold["val"])
+    if set(dataset.missing_record_ids) != expected_train_missing:
+        raise RuntimeError("Mini train availability differs from the locked CV manifest")
+    if set(validation_dataset.missing_record_ids) != expected_validation_missing:
+        raise RuntimeError("Mini validation availability differs from the locked CV manifest")
+    if set(dataset.qualified_record_ids) & set(validation_dataset.qualified_record_ids):
+        raise RuntimeError("Mini train and validation qualified records overlap")
     if world_size > 1:
         identities = [None for _ in range(world_size)]
         dist.all_gather_object(
             identities,
-            (len(dataset), len(dataset.rejections), dataset.mapping_sha256),
+            (
+                len(dataset), len(dataset.rejections), dataset.mapping_sha256,
+                len(validation_dataset), len(validation_dataset.rejections), validation_dataset.mapping_sha256,
+                dataset.missing_record_ids, validation_dataset.missing_record_ids,
+            ),
         )
         if len(set(identities)) != 1:
             raise RuntimeError(f"Mini dataset identity differs across ranks: {identities}")
@@ -135,6 +228,15 @@ def main():
         dataset, batch_size=args.batch_size, shuffle=sampler is None, sampler=sampler,
         collate_fn=collate_mini, num_workers=args.num_workers,
         pin_memory=device.type == "cuda", persistent_workers=args.num_workers > 0,
+    )
+    validation_sampler = DistributedSampler(
+        validation_dataset, num_replicas=world_size, rank=rank, shuffle=False, drop_last=True,
+    ) if world_size > 1 else None
+    validation_loader = DataLoader(
+        validation_dataset, batch_size=args.batch_size,
+        shuffle=False, sampler=validation_sampler, collate_fn=collate_mini,
+        num_workers=args.num_workers, pin_memory=device.type == "cuda",
+        persistent_workers=args.num_workers > 0,
     )
     system = MiniTrainingSystem().to(device)
     if world_size > 1:
@@ -151,6 +253,10 @@ def main():
         "source_commit": source_commit,
         "preflight_sha256": preflight_sha256,
         "dataset_mapping_sha256": dataset.mapping_sha256,
+        "validation_mapping_sha256": validation_dataset.mapping_sha256,
+        "cv_split_manifest_sha256": cv_split["manifest_sha256"],
+        "source_split_manifest_sha256": source_split["manifest_sha256"],
+        "fold": args.fold,
         "seed": args.seed,
     }
     if rank == 0:
@@ -163,11 +269,31 @@ def main():
             "world_size": world_size, "per_rank_batch_size": args.batch_size,
             "global_batch_size": args.batch_size * world_size,
             "steps": args.steps, "seed": args.seed,
+            "fold": args.fold, "fold_count": cv_split["fold_count"],
             "metadata": str(Path(args.metadata).resolve()),
             "structure_root": str(Path(args.structure_root).resolve()),
-            "qualified_example_count": len(dataset),
+            "split": str(Path(args.split).resolve()),
+            "source_split": str(Path(args.source_split).resolve()),
+            "cv_split_manifest_sha256": cv_split["manifest_sha256"],
+            "source_split_manifest_sha256": source_split["manifest_sha256"],
+            "locked_test_record_count": cv_split["locked_test_record_count"],
+            "locked_test_loaded_during_training": False,
+            "train_requested_record_count": selected_fold["train_record_count"],
+            "validation_requested_record_count": selected_fold["val_record_count"],
+            "train_qualified_record_count": len(dataset.qualified_record_ids),
+            "validation_qualified_record_count": len(validation_dataset.qualified_record_ids),
+            "train_missing_record_ids": list(dataset.missing_record_ids),
+            "validation_missing_record_ids": list(validation_dataset.missing_record_ids),
+            "qualified_example_count": len(dataset), "validation_qualified_example_count": len(validation_dataset),
             "rejected_example_count": len(dataset.rejections),
+            "validation_rejected_example_count": len(validation_dataset.rejections),
             "dataset_mapping_sha256": dataset.mapping_sha256,
+            "validation_mapping_sha256": validation_dataset.mapping_sha256,
+            "validation_every": args.validate_every,
+            "validation_max_batches": args.validation_max_batches,
+            "validation_dropped_for_equal_ranks": (
+                len(validation_dataset) - validation_sampler.total_size if validation_sampler is not None else 0
+            ),
             "source_commit": source_commit,
             "preflight_sha256": preflight_sha256,
             "preflight": str(Path(args.preflight).resolve()),
@@ -175,6 +301,8 @@ def main():
             "cuda_devices": [torch.cuda.get_device_name(index) for index in range(torch.cuda.device_count())] if device.type == "cuda" else [],
         }
         _write_json(run_dir / "run_manifest.json", manifest)
+        (run_dir / "cv_split.json").write_text(Path(args.split).read_text(encoding="utf-8"), encoding="utf-8")
+        (run_dir / "source_split.json").write_text(Path(args.source_split).read_text(encoding="utf-8"), encoding="utf-8")
         (run_dir / "metrics.jsonl").touch()
         _write_json(run_dir / "train_status.json", {"status": "RUNNING", "step": 0, **manifest})
         def mark_incomplete_run():
@@ -210,32 +338,9 @@ def main():
                 sampler.set_epoch(epoch)
             iterator = iter(loader)
             batch = next(iterator)
-        B, _M, L, _A, _ = batch["core"].shape
-        x0 = torch.zeros_like(batch["core"])
-        for b, condition in enumerate(batch["conditions"]):
-            mode = sample_prior_mode(generator)
-            try:
-                prior = sample_peptide_prior(condition, mode=mode, generator=generator)
-            except Exception as exc:
-                raise RuntimeError(
-                    "procedural prior failed for "
-                    f"rank={rank}, step={step}, batch_index={b}, mode={mode}, "
-                    f"sequence={condition.sequence}, k={condition.k}, p={condition.p}"
-                ) from exc
-            x0[b, 0, :len(condition.sequence)] = prior.coordinates
-        aa_ids = batch["aa_ids"].to(device, non_blocking=True)
-        token_mask = batch["token_mask"].to(device, non_blocking=True)
-        target = batch["core"].to(device, non_blocking=True)
-        core_mask = batch["core_mask"].to(device, non_blocking=True)
-        x0 = x0.to(device, non_blocking=True)
-        t = torch.rand((B,), generator=generator).to(device).clamp(.02, .98)
-        output = system(
-            aa_ids=aa_ids, token_mask=token_mask, target=target, core_mask=core_mask,
-            target14=batch["atom14"].to(device, non_blocking=True),
-            target14_mask=batch["atom14_mask"].to(device, non_blocking=True),
-            k=batch["k"].to(device, non_blocking=True), p=batch["p"].to(device, non_blocking=True),
-            acceptor_type=batch["acceptor_type"].to(device, non_blocking=True),
-            conditions=batch["conditions"], x0=x0, t=t,
+        output, B = _forward_batch(
+            system, batch, device=device, generator=generator, rank=rank,
+            step=step, phase="train",
         )
         optimizer.zero_grad(set_to_none=True)
         output.total.backward()
@@ -253,6 +358,9 @@ def main():
                 "distributed_backend": "fsdp_full_shard" if world_size > 1 else "none",
                 "source_commit": source_commit, "preflight_sha256": preflight_sha256,
                 "dataset_mapping_sha256": dataset.mapping_sha256, "seed": args.seed,
+                "cv_split_manifest_sha256": cv_split["manifest_sha256"],
+                "source_split_manifest_sha256": source_split["manifest_sha256"],
+                "fold": args.fold,
                 "step": step, "world_size": world_size,
                 "global_sample_count": global_samples,
                 "total": reduced[0], "core": reduced[1], "sidechain": reduced[2],
@@ -266,6 +374,31 @@ def main():
                 with (run_dir / "metrics.jsonl").open("a", encoding="utf-8") as handle:
                     handle.write(encoded + "\n"); handle.flush()
                 _write_json(run_dir / "train_status.json", {"status": "RUNNING", **row})
+                print(encoded, flush=True)
+        if step == 1 or step % args.validate_every == 0:
+            validation_values, validation_samples = _validate(
+                system, validation_loader, device=device, rank=rank, world_size=world_size,
+                seed=args.seed, fold=args.fold, step=step,
+                max_batches=args.validation_max_batches,
+            )
+            validation_row = {
+                "event": "validation", "architecture_id": ARCHITECTURE_ID_MINI,
+                "distributed_backend": "fsdp_full_shard" if world_size > 1 else "none",
+                "source_commit": source_commit, "preflight_sha256": preflight_sha256,
+                "dataset_mapping_sha256": validation_dataset.mapping_sha256,
+                "cv_split_manifest_sha256": cv_split["manifest_sha256"],
+                "source_split_manifest_sha256": source_split["manifest_sha256"],
+                "seed": args.seed, "fold": args.fold, "step": step,
+                "world_size": world_size, "global_sample_count": validation_samples,
+                "total": validation_values[0], "core": validation_values[1],
+                "sidechain": validation_values[2], "refine": validation_values[3],
+                "viability": validation_values[4],
+                "locked_test_loaded": False,
+            }
+            if rank == 0:
+                encoded = json.dumps(validation_row, sort_keys=True, allow_nan=False)
+                with (run_dir / "metrics.jsonl").open("a", encoding="utf-8") as handle:
+                    handle.write(encoded + "\n"); handle.flush()
                 print(encoded, flush=True)
         if step % args.save_every == 0:
             _save_checkpoint(
