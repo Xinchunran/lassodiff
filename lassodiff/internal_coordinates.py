@@ -118,7 +118,24 @@ def build_backbone_from_ca_trace(sequence: str, ca: torch.Tensor) -> torch.Tenso
         if float(normal.norm()) < 1e-6:
             normal = first_normal
         normal = normal / normal.norm().clamp_min(1e-8)
-        c_direction = 0.82 * unit + math.sqrt(1 - .82**2) * normal
+        # Choose the CA->C projection so that the next N can lie on both the
+        # C--N and N--CA spheres.  A fixed projection is only valid near a
+        # 3.8 A CA trace and incorrectly rejects still-realizable ~4.1 A
+        # procedural steps.
+        preferred_cosine = .82
+        preferred_separation2 = (
+            float(distance) ** 2 + BOND_CA_C ** 2
+            - 2 * float(distance) * BOND_CA_C * preferred_cosine
+        )
+        preferred_separation = math.sqrt(max(preferred_separation2, 0.0))
+        lower = abs(BOND_C_N - BOND_N_CA) + 1e-3
+        upper = BOND_C_N + BOND_N_CA - 1e-3
+        target_separation = min(max(preferred_separation, lower), upper)
+        cosine = (
+            float(distance) ** 2 + BOND_CA_C ** 2 - target_separation ** 2
+        ) / (2 * float(distance) * BOND_CA_C)
+        cosine = min(max(cosine, -1.0), 1.0)
+        c_direction = cosine * unit + math.sqrt(max(1 - cosine**2, 0.0)) * normal
         c_atom = ca[index] + BOND_CA_C * c_direction
         to_next_ca = ca[index + 1] - c_atom
         separation = to_next_ca.norm()

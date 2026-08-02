@@ -5,7 +5,16 @@ model:
   hidden_dim: 128
   diffusion_blocks: 4
   refiner_blocks: 4
+  refiner_max_neighbors: 32
   max_refiner_displacement: 0.75
+training:
+  distributed: fsdp_full_shard
+  world_size: 4
+  per_rank_batch_size: 4
+  global_batch_size: 16
+  steps: 20000
+  log_every: 10
+  save_every: 500
 peptide_prior:
   open_chain: 0.40
   single_crossing: 0.40

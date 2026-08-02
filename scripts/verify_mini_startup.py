@@ -19,6 +19,7 @@ from lassodiff.seq_encoder import seq_to_aa_ids
 from lassodiff.sidechain_builder import build_atom14
 from lassodiff.structure_processor import isopeptide_distance, process_lasso_structure
 from lassodiff.topology_adapter import CandidateBatch
+from lassodiff.training_mini import MiniTrainingOutput, MiniTrainingSystem
 from lassodiff.validation.threading_mini import hard_threading_check_ca
 
 
@@ -64,6 +65,13 @@ def main():
         raise RuntimeError("screening integrity preflight failed")
     if "coord" in " ".join(inspect.signature(CandidateViabilityHead.forward).parameters).lower():
         raise RuntimeError("viability head must not accept generated coordinates")
+    training_system = MiniTrainingSystem(hidden_dim=32, diffusion_blocks=2)
+    state_keys = tuple(training_system.state_dict())
+    required_prefixes = ("model.", "sidechain.", "refiner.", "viability.")
+    if not all(any(key.startswith(prefix) for key in state_keys) for prefix in required_prefixes):
+        raise RuntimeError("unified FSDP root is missing a required trainable module")
+    if getattr(MiniTrainingOutput.__dataclass_params__, "frozen", True):
+        raise RuntimeError("FSDP output must permit recursive backward-hook registration")
 
     atom14, atom14_mask = build_atom14(priors["single"].coordinates, candidate)
     refiner = MiniAtomRefiner(hidden_dim=24, layers=4, max_displacement=.5)
@@ -86,6 +94,9 @@ def main():
         "schema_version": MINI_SCHEMA_VERSION, "template_coordinates_used": False,
         "prior_crossing_counts": counts, "screening_projection": False,
         "screening_topology_guidance": False, "dynamic_geometry_calls": output.dynamic_geometry_calls,
+        "distributed_backend": "fsdp_full_shard",
+        "fsdp_root_modules": [prefix[:-1] for prefix in required_prefixes],
+        "fsdp_full_state_checkpoint": True,
         "chemistry_fixture": chemistry,
     }
     path = Path(args.output)

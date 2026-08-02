@@ -2,6 +2,7 @@ import torch
 
 from lassodiff.atom_schema_lasso import ATOM_C, ATOM_CA, ATOM_N, CandidateCondition
 from lassodiff.peptide_prior import sample_peptide_prior
+from lassodiff.internal_coordinates import build_backbone_from_ca_trace
 from lassodiff.topology_adapter import CandidateBatch
 from lassodiff.validation.threading_mini import hard_threading_check_ca
 
@@ -66,3 +67,11 @@ def test_candidate_kp_changes_prior_geometry():
     a = sample_peptide_prior(first, mode="single_crossing", noise_scale=0).coordinates
     b = sample_peptide_prior(second, mode="single_crossing", noise_scale=0).coordinates
     assert not torch.allclose(a, b)
+
+
+def test_ca_trace_reconstruction_accepts_long_but_physical_step():
+    sequence = "AAAA"
+    ca = torch.tensor([[0., 0., 0.], [4.1, 0., 0.], [8.2, 0.2, 0.], [12.3, 0.2, 0.]])
+    core = build_backbone_from_ca_trace(sequence, ca)
+    peptide = (core[:-1, ATOM_C] - core[1:, ATOM_N]).norm(dim=-1)
+    assert torch.allclose(peptide, torch.full_like(peptide, 1.329), atol=2e-4)

@@ -7,7 +7,7 @@ sequence + candidate(k,p)
   -> programmatic peptide prior
   -> core-7 equivariant diffusion
   -> rotamer/chi sidechain builder
-  -> bounded 4-layer all-heavy-atom refiner
+  -> bounded 4-layer sparse-kNN all-heavy-atom refiner
   -> strict chemistry/topology checker
 ```
 
@@ -48,21 +48,25 @@ Upper_Plug_2 <-> relax2/min2
 Upper_Plug_3 <-> relax3/min3
 ```
 
-同 rank 优先 `relaxN`，缺失时使用 `minN`。PDB 会去氢、规范化 `ASX/GLX`、生成 core/Atom14 mask，并保持 candidate 维度。
+同 rank 先验证 `relaxN`，缺失或非有限/化学不合格时再验证 `minN`；两者都失败的 example 显式计入 rejection，不会在训练中途随机报错。PDB 会去氢、规范化 `ASX/GLX`、生成 core/Atom14 mask，并保持 candidate 维度。所有 rank 必须得到相同的 qualified count、rejection count 与 mapping SHA-256，否则 FSDP 在创建 run 目录前失败。
 
 ## 训练
 
-下面是小规模开发训练；它不会自动下载数据或停止现有任务：
+正式训练使用单机 4-GPU FSDP full-shard；`--batch-size` 是每卡 batch，下面的 global batch 为 16。它不会自动下载数据或停止现有任务：
 
 ```bash
-python -m scripts.train_mini \
+/home/ranx/miniconda3/envs/DeltaCata/bin/torchrun \
+  --standalone --nproc-per-node=4 \
+  -m scripts.train_mini \
   --metadata /path/to/lassopred.data.json \
   --structure-root /path/to/structure \
   --preflight artifacts/mini/preflight.json \
   --run-dir runs/lassodiff-mini-dev \
   --batch-size 4 \
-  --steps 1000
+  --steps 20000 --log-every 10 --save-every 500
 ```
+
+FSDP 用一个统一 root 覆盖 core diffusion、sidechain、refiner 和 viability，并使用 `DistributedSampler` 与每-rank 独立 prior/noise seed。Full model/optimizer checkpoint 由所有 rank collective 汇集、仅 rank 0 写盘；日志和 status 也只有 rank 0 写。非空 run directory 会 fail closed，禁止多 rank 争写或覆盖历史任务。
 
 默认 prior 比例：
 

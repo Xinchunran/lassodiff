@@ -6,8 +6,9 @@ import torch.nn as nn
 
 
 class _EGNNRefinerBlock(nn.Module):
-    def __init__(self, hidden_dim: int):
+    def __init__(self, hidden_dim: int, max_neighbors: int):
         super().__init__()
+        self.max_neighbors = int(max_neighbors)
         self.message = nn.Sequential(
             nn.Linear(2 * hidden_dim + 2, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, hidden_dim), nn.SiLU(),
         )
@@ -15,14 +16,23 @@ class _EGNNRefinerBlock(nn.Module):
         self.node_update = nn.Sequential(nn.Linear(2 * hidden_dim, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, hidden_dim))
 
     def forward(self, h, x, mask, covalent):
-        relative = x[:, :, None] - x[:, None, :]
-        distance2 = relative.square().sum(-1, keepdim=True).clamp_max(100.0)
-        pair_mask = mask[:, :, None] & mask[:, None, :]
-        pair_mask &= ~torch.eye(x.shape[1], dtype=torch.bool, device=x.device)[None]
+        size = x.shape[1]
+        distance2_full = torch.cdist(x.float(), x.float()).square()
+        pair_valid = mask[:, :, None] & mask[:, None, :]
+        pair_valid &= ~torch.eye(size, dtype=torch.bool, device=x.device)[None]
+        ranking = distance2_full.masked_fill(~pair_valid, torch.inf)
+        neighbor_count = min(self.max_neighbors, max(size - 1, 1))
+        neighbor_distance2, neighbor = torch.topk(ranking, neighbor_count, dim=-1, largest=False)
+        batch = torch.arange(x.shape[0], device=x.device)[:, None, None]
+        h_j = h[batch, neighbor]
+        x_j = x[batch, neighbor]
+        h_i = h[:, :, None].expand(-1, -1, neighbor_count, -1)
+        relative = x[:, :, None] - x_j
+        distance2 = neighbor_distance2.clamp_max(100.0)[..., None].to(x.dtype)
+        pair_mask = torch.isfinite(neighbor_distance2) & mask[:, :, None]
+        covalent_neighbor = torch.gather(covalent, 2, neighbor)
         message = self.message(torch.cat((
-            h[:, :, None].expand(-1, -1, h.shape[1], -1),
-            h[:, None, :].expand(-1, h.shape[1], -1, -1),
-            distance2, covalent[..., None].to(distance2.dtype),
+            h_i, h_j, distance2, covalent_neighbor[..., None].to(distance2.dtype),
         ), dim=-1)) * pair_mask[..., None]
         denominator = pair_mask.sum(-1, keepdim=True).clamp_min(1).to(x.dtype)
         delta = (relative * self.coordinate_weight(message)).sum(2) / denominator
@@ -31,11 +41,14 @@ class _EGNNRefinerBlock(nn.Module):
 
 
 class MiniAtomRefiner(nn.Module):
-    def __init__(self, hidden_dim: int = 96, layers: int = 4, max_displacement: float = .75):
+    def __init__(
+        self, hidden_dim: int = 96, layers: int = 4,
+        max_displacement: float = .75, max_neighbors: int = 32,
+    ):
         super().__init__()
         self.residue_embedding = nn.Embedding(21, hidden_dim)
         self.atom_embedding = nn.Embedding(14, hidden_dim)
-        self.blocks = nn.ModuleList(_EGNNRefinerBlock(hidden_dim) for _ in range(layers))
+        self.blocks = nn.ModuleList(_EGNNRefinerBlock(hidden_dim, max_neighbors) for _ in range(layers))
         self.max_displacement = float(max_displacement)
 
     def forward(self, coordinates, aa_ids, atom_mask, covalent_adjacency=None):

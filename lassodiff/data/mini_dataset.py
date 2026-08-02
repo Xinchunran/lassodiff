@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,7 @@ class MiniLassoDataset(Dataset):
         rows = json.loads(Path(metadata_json).read_text(encoding="utf-8"))
         allowed = None if record_ids is None else set(record_ids)
         examples: list[dict[str, Any]] = []
+        rejections: list[dict[str, Any]] = []
         for row in rows:
             record_id = str(row.get("LP_ID") or "")
             if not record_id or (allowed is not None and record_id not in allowed):
@@ -38,12 +40,34 @@ class MiniLassoDataset(Dataset):
                 except ValueError:
                     continue
                 root = Path(structure_root) / record_id
-                target = next((root / name for name in (f"relax{rank}.pdb", f"min{rank}.pdb") if (root / name).is_file()), None)
+                targets = [root / name for name in (f"relax{rank}.pdb", f"min{rank}.pdb") if (root / name).is_file()]
+                target, failures = None, []
+                for path in targets:
+                    try:
+                        process_lasso_structure(path, candidate)
+                        target = path
+                        break
+                    except (ValueError, OSError) as exc:
+                        failures.append({"target": path.name, "reason": str(exc)})
                 if target is not None:
                     examples.append({"record_id": record_id, "rank": rank, "candidate": candidate, "target": target})
+                elif targets:
+                    rejections.append({"record_id": record_id, "rank": rank, "failures": failures})
         if not examples:
             raise ValueError("Mini dataset contains no candidate-specific examples")
         self.examples = examples
+        self.rejections = rejections
+        mapping = [
+            {
+                "record_id": item["record_id"], "rank": item["rank"],
+                "sequence": item["candidate"].sequence, "k": item["candidate"].k,
+                "p": item["candidate"].p, "target": str(item["target"].resolve()),
+            }
+            for item in examples
+        ]
+        self.mapping_sha256 = hashlib.sha256(
+            json.dumps(mapping, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+        ).hexdigest()
 
     def __len__(self):
         return len(self.examples)

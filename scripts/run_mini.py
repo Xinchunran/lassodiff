@@ -17,6 +17,7 @@ from lassodiff.sampler_mini import sample_mini
 from lassodiff.seq_encoder import seq_to_aa_ids
 from lassodiff.sidechain_builder import RotamerChiHead, build_atom14
 from lassodiff.topology_adapter import CandidateBatch
+from lassodiff.training_mini import MiniTrainingSystem
 from lassodiff.validation.strict_lasso import strict_lasso_check
 
 
@@ -38,10 +39,16 @@ def main():
     checkpoint = torch.load(args.checkpoint, map_location=device)
     if checkpoint.get("architecture_id") != ARCHITECTURE_ID_MINI:
         raise RuntimeError("checkpoint architecture does not match Mini")
-    model = MiniCoreDiffusion().to(device); model.load_state_dict(checkpoint["model"], strict=True); model.eval()
-    sidechain = RotamerChiHead(model.hidden_dim).to(device); sidechain.load_state_dict(checkpoint["sidechain"], strict=True); sidechain.eval()
-    refiner = MiniAtomRefiner().to(device); refiner.load_state_dict(checkpoint["refiner"], strict=True); refiner.eval()
-    viability = CandidateViabilityHead().to(device); viability.load_state_dict(checkpoint["viability"], strict=True); viability.eval()
+    if "system" in checkpoint:
+        system = MiniTrainingSystem().to(device)
+        system.load_state_dict(checkpoint["system"], strict=True)
+        model, sidechain, refiner, viability = system.model, system.sidechain, system.refiner, system.viability
+    else:
+        model = MiniCoreDiffusion().to(device); model.load_state_dict(checkpoint["model"], strict=True)
+        sidechain = RotamerChiHead(model.hidden_dim).to(device); sidechain.load_state_dict(checkpoint["sidechain"], strict=True)
+        refiner = MiniAtomRefiner().to(device); refiner.load_state_dict(checkpoint["refiner"], strict=True)
+        viability = CandidateViabilityHead().to(device); viability.load_state_dict(checkpoint["viability"], strict=True)
+    model.eval(); sidechain.eval(); refiner.eval(); viability.eval()
     aa = seq_to_aa_ids(candidate.sequence).to(device)[None]
     tokens = torch.ones_like(aa, dtype=torch.bool)
     candidate_batch = CandidateBatch(
