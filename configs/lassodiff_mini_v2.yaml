@@ -1,0 +1,38 @@
+architecture_id: lassodiff_mini_torsion_v2
+schema_version: 2
+encoder:
+  name: esm2_t30_150M_UR50D
+  revision: main
+  frozen: true
+  use_cache: true
+model:
+  single_dim: 256
+  pair_dim: 128
+  hidden_dim: 256
+  blocks: 8
+  heads: 8
+  dropout: 0.05
+state:
+  backbone_torsions: [phi, psi, omega]
+  acceptor_chi: true
+  canonical_root_frame: true
+prior:
+  training: {open_chain: 0.80, broad_ramachandran: 0.20, single_crossing: 0.00}
+  inference_unassisted: {mode: open_chain}
+  inference_assisted: {mode: single_crossing}
+training:
+  distributed: fsdp_full_shard
+  per_rank_batch_size: 4
+  gradient_clip: 1.0
+  stages:
+    backbone: {steps: 10000, learning_rate: 0.0002}
+    sidechain: {steps: 4000, learning_rate: 0.0001}
+    refiner: {steps: 3000, learning_rate: 0.0001}
+    joint: {steps: 3000, learning_rate: 0.00002}
+sampler: {method: heun, steps: 60}
+evaluation:
+  samples_per_candidate: 8
+  report_prior_only: true
+  report_untrained: true
+  report_assisted_separately: true
+  strict_checker: lassodiff.validation.strict_lasso

@@ -9,6 +9,9 @@ import torch
 
 
 MINI_SCHEMA_VERSION = 1
+MINI_TORSION_SCHEMA_VERSION = 2
+LEGACY_MINI_ARCHITECTURE_ID = "lassodiff_mini_core7_legacy"
+MINI_TORSION_ARCHITECTURE_ID = "lassodiff_mini_torsion_v2"
 CORE_ATOM_NAMES = ("N", "CA", "C", "O", "CB", "CISO", "OISO")
 
 

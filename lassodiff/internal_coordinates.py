@@ -21,8 +21,8 @@ CA_TRACE_SPACING = 3.80
 
 def place_atom(a, b, c, length: float, angle_degrees: float, dihedral_degrees: float):
     """Natural-extension-reference-frame placement of atom d after a-b-c."""
-    angle = torch.as_tensor(math.radians(angle_degrees), dtype=c.dtype, device=c.device)
-    dihedral = torch.as_tensor(math.radians(dihedral_degrees), dtype=c.dtype, device=c.device)
+    angle = torch.as_tensor(angle_degrees, dtype=c.dtype, device=c.device) * (math.pi / 180.0)
+    dihedral = torch.as_tensor(dihedral_degrees, dtype=c.dtype, device=c.device) * (math.pi / 180.0)
     bc = c - b
     bc = bc / bc.norm().clamp_min(1e-8)
     normal = torch.linalg.cross(b - a, bc, dim=-1)
@@ -71,15 +71,15 @@ def build_backbone_from_torsions(
         previous = core[index - 1]
         core[index, ATOM_N] = place_atom(
             previous[ATOM_N], previous[ATOM_CA], previous[ATOM_C],
-            BOND_C_N, 116.2, float(psi[index - 1]),
+            BOND_C_N, 116.2, psi[index - 1],
         )
         core[index, ATOM_CA] = place_atom(
             previous[ATOM_CA], previous[ATOM_C], core[index, ATOM_N],
-            BOND_N_CA, 121.7, float(omega[index - 1]),
+            BOND_N_CA, 121.7, omega[index - 1],
         )
         core[index, ATOM_C] = place_atom(
             previous[ATOM_C], core[index, ATOM_N], core[index, ATOM_CA],
-            BOND_CA_C, 111.2, float(phi[index]),
+            BOND_CA_C, 111.2, phi[index],
         )
     for index in range(length):
         core[index, ATOM_O] = place_atom(

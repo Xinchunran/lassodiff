@@ -1,0 +1,114 @@
+"""Candidate-grouped Mini dataset and fixed-conformer collate."""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Iterable
+
+import torch
+from torch.utils.data import Dataset
+
+
+def grouped_target_mapping_sha256(examples: Iterable[dict[str, Any]]) -> str:
+    import hashlib
+    import json
+    mapping = [{key: row[key] for key in ("record_id", "sequence", "k", "p")} for row in examples]
+    return hashlib.sha256(json.dumps(mapping, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+@dataclass(frozen=True)
+class GroupedMiniExample:
+    record_id: str
+    sequence: str
+    k: int
+    p: int
+    core_targets: torch.Tensor
+    core_target_masks: torch.Tensor
+    atom14_targets: torch.Tensor
+    atom14_target_masks: torch.Tensor
+    backbone_torsions: torch.Tensor
+    backbone_torsion_masks: torch.Tensor
+    chi_targets: torch.Tensor
+    chi_masks: torch.Tensor
+    conformer_mask: torch.Tensor
+
+
+_TARGET_KEYS = (
+    ("core", "core_targets", (7, 3), torch.float32),
+    ("core_mask", "core_target_masks", (7,), torch.bool),
+    ("atom14", "atom14_targets", (14, 3), torch.float32),
+    ("atom14_mask", "atom14_target_masks", (14,), torch.bool),
+    ("backbone_torsions", "backbone_torsions", (3,), torch.float32),
+    ("backbone_torsion_mask", "backbone_torsion_masks", (3,), torch.bool),
+    ("chi", "chi_targets", (4,), torch.float32),
+    ("chi_mask", "chi_masks", (4,), torch.bool),
+)
+
+
+def group_candidate_examples(rows: Iterable[dict[str, Any]], max_conformers: int = 3) -> list[dict[str, Any]]:
+    if max_conformers < 1:
+        raise ValueError("max_conformers must be positive")
+    groups: dict[tuple[str, str, int, int], list[dict[str, Any]]] = {}
+    for row in rows:
+        key = (str(row["record_id"]), str(row["sequence"]), int(row["k"]), int(row["p"]))
+        groups.setdefault(key, []).append(row)
+    output = []
+    for key in sorted(groups):
+        record_id, sequence, k, p = key
+        members = sorted(groups[key], key=lambda row: (int(row.get("rank", 0)), str(row.get("target", ""))))[:max_conformers]
+        length = len(sequence)
+        result: dict[str, Any] = {"record_id": record_id, "sequence": sequence, "k": k, "p": p}
+        for source, destination, tail, dtype in _TARGET_KEYS:
+            shape = (max_conformers, length, *tail)
+            result[destination] = torch.zeros(shape, dtype=dtype)
+        result["conformer_mask"] = torch.zeros((max_conformers,), dtype=torch.bool)
+        for index, member in enumerate(members):
+            result["conformer_mask"][index] = True
+            for source, destination, _tail, _dtype in _TARGET_KEYS:
+                if source not in member:
+                    raise ValueError(f"grouped target row is missing {source}")
+                value = torch.as_tensor(member[source])
+                expected = result[destination][index].shape
+                if value.shape != expected:
+                    raise ValueError(f"target {source} has shape {tuple(value.shape)}, expected {tuple(expected)}")
+                result[destination][index] = value.to(dtype=result[destination].dtype)
+        output.append(result)
+    return output
+
+
+def collate_grouped_mini(items: list[dict[str, Any] | GroupedMiniExample]) -> dict[str, Any]:
+    if not items:
+        raise ValueError("cannot collate an empty grouped Mini batch")
+    rows = [item if isinstance(item, dict) else item.__dict__ for item in items]
+    batch_size = len(rows)
+    max_conformers = rows[0]["conformer_mask"].shape[0]
+    max_length = max(len(row["sequence"]) for row in rows)
+    result: dict[str, Any] = {
+        "record_ids": [row["record_id"] for row in rows],
+        "sequences": [row["sequence"] for row in rows],
+        "k": torch.zeros((batch_size,), dtype=torch.long),
+        "p": torch.zeros((batch_size,), dtype=torch.long),
+        "token_mask": torch.zeros((batch_size, max_length), dtype=torch.bool),
+    }
+    for _source, destination, tail, dtype in _TARGET_KEYS:
+        result[destination] = torch.zeros((batch_size, max_conformers, max_length, *tail), dtype=dtype)
+    result["conformer_mask"] = torch.zeros((batch_size, max_conformers), dtype=torch.bool)
+    for batch_index, row in enumerate(rows):
+        length = len(row["sequence"])
+        result["k"][batch_index] = int(row["k"])
+        result["p"][batch_index] = int(row["p"])
+        result["token_mask"][batch_index, :length] = True
+        result["conformer_mask"][batch_index] = row["conformer_mask"]
+        for _source, destination, _tail, _dtype in _TARGET_KEYS:
+            result[destination][batch_index, :, :length] = row[destination]
+    return result
+
+
+class GroupedMiniDataset(Dataset):
+    def __init__(self, rows: Iterable[dict[str, Any]], max_conformers: int = 3):
+        self.examples = group_candidate_examples(rows, max_conformers=max_conformers)
+
+    def __len__(self):
+        return len(self.examples)
+
+    def __getitem__(self, index):
+        return self.examples[index]

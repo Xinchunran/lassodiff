@@ -4,21 +4,26 @@
 
 ```text
 sequence + candidate(k,p)
-  -> programmatic peptide prior
-  -> core-7 equivariant diffusion
-  -> rotamer/chi sidechain builder
-  -> bounded 4-layer sparse-kNN all-heavy-atom refiner
+  -> frozen ESM residue conditioning
+  -> random open-chain torsion prior
+  -> dynamic-geometry torsion diffusion
+  -> exact chain-kinematic backbone decoder
+  -> residue-specific chi / rigid-group Atom14 reconstruction
+  -> covalent-aware bounded all-heavy-atom refiner
   -> strict chemistry/topology checker
 ```
 
-当前版本：`4.0.0-mini.1`。架构 preflight 与 mini 单测已通过；仓库尚未提供训练完成的 mini checkpoint，因此不能把程序化 seed 或随机权重输出称为已训练生成结果。
+当前 active architecture：`lassodiff_mini_torsion_v2`，`schema_version = 2`。仓库尚未提供训练完成的新版 checkpoint，因此不能把程序化 seed、随机权重或 assisted seed 输出称为已训练生成结果。
 
 ## 开发边界
 
-- Mini 的唯一坐标 schema 是 `N/CA/C/O/CB/CISO/OISO`。
+- Mini 的 backbone/reactive core schema 保持 `N/CA/C/O/CB/CISO/OISO`；生产状态是 `phi/psi/omega + acceptor chi`，不是 Cartesian core diffusion。
 - `ASP_ISO` 使用 `CISO=CG, OISO=OD1`；`GLU_ISO` 使用 `CISO=CD, OISO=OE1`。
 - formed acceptor 只有一个 carbonyl oxygen；不存在的 atom 必须由 mask 表示，禁止用零坐标冒充。
-- 每个 `(sequence,k,p,target-rank)` 是独立训练样本；非法 candidate 直接失败，不做 `clamp()`。
+- V2 按 `(record_id, sequence, k, p)` 聚合 conformers，缺失 conformer 由 mask 表示，不复制 rank；非法 candidate 直接失败，不做 `clamp()`。
+- ESM residue encoder 必须在 active forward graph 中执行、冻结、eval、detach；cache 不得包含 target、candidate label 或 fold 信息。
+- headline `unassisted` 只允许 open-chain prior；single-crossing 只能作为显式 `assisted` secondary mode，不能合并 success rate。
+- 旧 Cartesian core-7 与 frame-v1 checkpoint 是 legacy，不能以 V2 architecture ID 加载或静默 warm-start。
 - prior 只使用 sequence、`k/p` 和通用肽链几何，不读取模板坐标。
 - screening 固定使用 open-chain prior，并关闭 projection/topology guidance。
 - strict checker 是最终真值；construction 成功率不能替代 sequence feasibility。
@@ -38,7 +43,7 @@ python -m scripts.verify_mini_startup \
 python -m pytest tests/mini -q
 ```
 
-preflight 会行为验证：ASX 单氧 chemistry、无模板 prior、0/1/2 crossing fixtures、current-coordinate dependence、screening 无 projection/guidance、侧链完整性和 refiner 最大位移。任一失败都不得训练。
+preflight 会行为验证：ESM active route、ASX 单氧 chemistry、无模板/open-chain prior、0/1/2 crossing fixtures、current-coordinate dependence、dynamic geometry、sidechain/covalent graph、screening 无 projection/guidance 和 strict checker route。任一失败都不得训练。
 
 ## 数据
 
@@ -63,7 +68,35 @@ python -m scripts.build_mini_cv_split \
   --output data/mini_cv5_locked_test_v1.json --seed 17
 ```
 
-## 训练
+## Legacy 训练路径与 active V2 gate
+
+下面原有 `scripts.train_mini`、`scripts.train_mini_cv`、`scripts.run_mini` 和
+`configs/lassodiff_mini.yaml` 命令只用于复现旧 core-7/frame 实验，不是
+`mini_dev` 新版生产入口。它们不得加载为
+`lassodiff_mini_torsion_v2`，也不得把 single-crossing construction 结果
+计入新版 unassisted 指标。
+
+新版入口文件为：
+
+```text
+scripts/cache_mini_esm.py
+scripts/train_mini_v2.py
+scripts/overfit_mini_v2.py
+scripts/evaluate_mini_v2.py
+configs/lassodiff_mini_v2.yaml
+```
+
+新版正式训练前必须完成：
+
+```bash
+python -m pytest tests/mini_v2 -q -m "not slow"
+python -m pytest tests/mini_v2 -q
+```
+
+任何 preflight、overfit 或 strict evaluation 失败都必须 fail closed，不能
+继续 full training 或五折 rollout。
+
+### Legacy commands
 
 正式训练使用单机 4-GPU FSDP full-shard；`--batch-size` 是每卡 batch，下面的 global batch 为 16。它不会自动下载数据或停止现有任务：
 
@@ -96,17 +129,17 @@ python -m scripts.train_mini_cv \
 
 FSDP 用一个统一 root 覆盖 core diffusion、sidechain、refiner 和 viability，并使用 `DistributedSampler` 与每-rank 独立 prior/noise seed。Full model/optimizer checkpoint 由所有 rank collective 汇集、仅 rank 0 写盘；日志和 status 也只有 rank 0 写。非空 run directory 会 fail closed，禁止多 rank 争写或覆盖历史任务。
 
-默认 prior 比例：
+旧 Cartesian mini 的默认 prior 比例仅用于 legacy reproduction；新版生产训练 prior 为：
 
 ```yaml
-open_chain: 0.40
-single_crossing: 0.40
-topology_corrupted: 0.20
+open_chain: 0.80
+broad_ramachandran: 0.20
+single_crossing: 0.00
 ```
 
 训练目标分成三段：core flow + peptide/iso/clash/exactly-one；rotamer/χ 驱动的 Atom14 坐标；最大位移受限的 all-heavy refiner。coordinate-free viability head 同时使用正确 candidate 与 wrong-plug hard negative，checkpoint 必须严格加载全部四个模块。
 
-## Construction
+## Legacy Construction
 
 `k/p` 均为 zero-based。需要已训练 checkpoint：
 
@@ -118,9 +151,9 @@ python -m scripts.run_mini construction \
   --output candidate.pdb
 ```
 
-Construction 默认 single-crossing procedural seed。所有样本仍必须经过 strict checker；若没有 strict-valid 样本，JSON 会保留逐项 rejection reason，不会把“生成了坐标”写成成功。
+新版 headline rollout 使用 random open-chain torsion prior。所有样本必须经过现有 `lassodiff.validation.strict_lasso`；若没有 strict-valid 样本，JSON 会保留逐项 rejection reason，不会把“生成了坐标”写成成功。single-crossing 只能在 `assisted` 报告中单独出现。
 
-## Screening
+## Legacy Screening
 
 ```bash
 python -m scripts.run_mini screening \
@@ -145,6 +178,8 @@ candidate_score = candidate_viability * unassisted_valid_rate
 
 Construction 与 screening 必须分别报告，所有记录至少携带 checkpoint、seed、candidate mapping、prior mode、sampler steps、projection/guidance flags 和 sample count。release 前仍需 locked validation、hard-negative calibration 与 paired comparison；训练 loss 下降不构成完成证据。
 
+新版 paired rollout 使用 `scripts/evaluate_mini_v2.py` 及 `lassodiff.evaluation_mini_v2` 合同，必须同时报告 `prior_only_unassisted`、`untrained_model_unassisted`、`trained_model_unassisted`、`trained_model_assisted`。固定 sequence、candidate、seed set、sample count 和 sampler steps；每个 sample 的最终有效性只能来自 strict checker。synthetic negatives 不能替代真实 non-lasso 校准。
+
 ## 主要文件
 
 ```text
@@ -164,5 +199,18 @@ scripts/train_mini.py                三段训练
 scripts/train_mini_cv.py             顺序执行 5 个四卡 folds
 scripts/run_mini.py                  construction/screening
 configs/lassodiff_mini.yaml          默认合同
-tests/mini/                          mini correctness tests
+configs/lassodiff_mini_v2.yaml       active torsion mini_dev 合同
+tests/mini/                          legacy mini correctness tests
+tests/mini_v2/                       active torsion/chemistry/strict contract tests
 ```
+
+## Active mini_dev release gates
+
+新版 mini_dev 在任何 full training 或五折 rollout 前必须通过：
+
+```bash
+python -m pytest tests/mini_v2 -q -m "not slow"
+python -m pytest tests/mini_v2 -q
+```
+
+slow gate、locked validation 和最终 Lasso 评价都必须调用同一个 `strict_lasso_check`。teacher-forced loss、坐标有限性、backbone bond validity、single-crossing seed 成功率和 checkpoint keys 都不能单独构成 release 证据。
