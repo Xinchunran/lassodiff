@@ -1,0 +1,43 @@
+architecture_id: lassodiff_opendde_v3
+schema_version: 3
+strict: true
+allow_fallback: false
+reasoning:
+  backend: opendde_pretrained
+  source_root: third_party/OpenDDE
+  runtime_root: ${OPENDDE_RUNTIME_ROOT}
+  checkpoint_path: ${OPENDDE_RUNTIME_ROOT}/checkpoint/opendde.pt
+  checkpoint_sha256: 7b826620390afad877ee2babc6a4d0df81b94d3a0be030959853d6a7da0807cc
+  opendde_commit: f607bb3c9ff299c0627ac20f5ef8e25d716ed46f
+  expected_numel: 655791538
+  freeze: true
+  use_msa: false
+  use_template: false
+  cache_dir: /tmp/lassodiff-opendde-test-cache
+  cache_schema_version: 1
+  n_cycle: 1
+  dtype: float32
+model: {c_s: 32, c_z: 32, c_a: 32, n_heads: 4, diffusion_blocks: 2, expected_trainable_numel: 68799}
+sequence_gate:
+  enabled: true
+  use_pair_state: true
+  reject_threshold: 0.10
+  accept_threshold: 0.80
+  target_validation_fpr: 0.01
+  ood_threshold: 0.90
+topology: {candidate_specific: true, max_candidates: 3, allow_invalid_clamp: false}
+structure:
+  structural_tokens: true
+  dynamic_geometry: true
+  geometry_per_block: true
+  candidate_prior_detach: true
+  reasoning_gradient_scale: 0.10
+  target_policy: topology_valid
+  flow_loss_weight: 1.0
+  bond_loss_weight: 1.0
+  iso_distance_loss_weight: 10.0
+  iso_angle_loss_weight: 2.0
+  iso_plane_loss_weight: 2.0
+  threading_loss_weight: 2.0
+screening: {run_diffusion: false, hard_iso_projection: false, topology_guidance: false, allow_user_kp_override: false}
+training: {opendde_lr: 0.0, adapter_lr: 1.0e-4, gate_lr: 1.0e-4, structure_lr: 1.0e-4}

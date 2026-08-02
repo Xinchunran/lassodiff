@@ -7,15 +7,27 @@ import torch
 AA3_TO_AA1: Dict[str, str] = {
     "ALA": "A",
     "CYS": "C",
+    "CYM": "C",
+    "CYX": "C",
     "ASP": "D",
+    "ASH": "D",
     "GLU": "E",
+    "GLH": "E",
     "PHE": "F",
     "GLY": "G",
     "HIS": "H",
+    "HID": "H",
+    "HIE": "H",
+    "HIP": "H",
+    "HSD": "H",
+    "HSE": "H",
+    "HSP": "H",
     "ILE": "I",
     "LYS": "K",
+    "LYN": "K",
     "LEU": "L",
     "MET": "M",
+    "MSE": "M",
     "ASN": "N",
     "PRO": "P",
     "GLN": "Q",
@@ -77,6 +89,10 @@ def _normalize_acceptor_type(acceptor_type: Optional[str]) -> Optional[str]:
         return "ASP"
     if t in ("GLU", "E"):
         return "GLU"
+    if t in ("ASH",):
+        return "ASP"
+    if t in ("GLH",):
+        return "GLU"
     return None
 
 
@@ -90,6 +106,18 @@ def _resolve_acceptor_index(residues, acceptor_index: Optional[int]) -> Optional
             return i
     if 1 <= acceptor_index <= len(residues):
         return acceptor_index - 1
+    return None
+
+
+def _select_iso_atom_names(atoms: Dict[str, List[float]], acceptor_type: Optional[str]) -> Optional[Tuple[str, str, str]]:
+    if acceptor_type == "ASP":
+        return "CG", "OD1", "OD2"
+    if acceptor_type == "GLU":
+        return "CD", "OE1", "OE2"
+    if "CD" in atoms or "OE1" in atoms or "OE2" in atoms:
+        return "CD", "OE1", "OE2"
+    if "CG" in atoms or "OD1" in atoms or "OD2" in atoms:
+        return "CG", "OD1", "OD2"
     return None
 
 
@@ -130,23 +158,21 @@ def process_structure_backbone(
             else:
                 atom_coords.append(pos)
                 atom_mask.append(True)
-        this_acceptor_type = acceptor_type
-        if this_acceptor_type is None and acceptor_idx is not None and i == acceptor_idx:
-            if resname == "ASP":
-                this_acceptor_type = "ASP"
-            elif resname == "GLU":
-                this_acceptor_type = "GLU"
-        if acceptor_idx is not None and i == acceptor_idx and this_acceptor_type in ("ASP", "GLU"):
-            c_name = "CG" if this_acceptor_type == "ASP" else "CD"
-            o1_name, o2_name = ("OD1", "OD2") if this_acceptor_type == "ASP" else ("OE1", "OE2")
-            for atom_name in (c_name, o1_name, o2_name):
-                pos = atoms.get(atom_name)
-                if pos is None:
+        if acceptor_idx is not None and i == acceptor_idx:
+            atom_names = _select_iso_atom_names(atoms, acceptor_type)
+            if atom_names is not None:
+                for atom_name in atom_names:
+                    pos = atoms.get(atom_name)
+                    if pos is None:
+                        atom_coords.append([0.0, 0.0, 0.0])
+                        atom_mask.append(False)
+                    else:
+                        atom_coords.append(pos)
+                        atom_mask.append(True)
+            else:
+                for _ in range(3):
                     atom_coords.append([0.0, 0.0, 0.0])
                     atom_mask.append(False)
-                else:
-                    atom_coords.append(pos)
-                    atom_mask.append(True)
         else:
             for _ in range(3):
                 atom_coords.append([0.0, 0.0, 0.0])

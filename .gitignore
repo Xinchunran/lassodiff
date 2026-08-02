@@ -1,0 +1,27 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+coverage.xml
+pytest.xml
+
+# Local datasets, cached embeddings/reasoning, checkpoints and run logs.
+/data/
+/artifacts/
+/runs/
+/log/
+/log_*/
+/results.txt
+
+# Model weights and generated structures are not source code.
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# Local environments and editor state.
+.env
+.venv/
+.idea/
+.vscode/
+*.swp

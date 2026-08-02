@@ -1,0 +1,3 @@
+[submodule "third_party/OpenDDE"]
+	path = third_party/OpenDDE
+	url = https://github.com/aurekaresearch/OpenDDE.git

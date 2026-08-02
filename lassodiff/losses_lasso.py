@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import os
 import torch
 import torch.nn.functional as F
 
@@ -22,20 +23,23 @@ def hinge_band(d, dmin, dmax):
 class LossWeights:
     w_flow: float = 1.0
     w_bb: float = 0.2
+    w_bond: float = 1.0
     w_iso: float = 10.0
     w_plug: float = 1.0
     w_thr: float = 0.5
     w_clash: float = 0.1
     w_link: float = 0.0
     w_tube: float = 0.0
+    w_angle: float = 1.0
+    w_dihedral: float = 1.0
 
 
 @dataclass
 class IsoCfg:
-    dmin: float = 2.0
-    dmax: float = 3.0
-    angle_min: float = 90.0
-    angle_max: float = 140.0
+    dmin: float = 1.25
+    dmax: float = 1.45
+    angle_min: float = 110.0
+    angle_max: float = 130.0
     angle_weight: float = 1.0
     plane_weight: float = 0.1
 
@@ -91,42 +95,524 @@ def region_weights(L: int, k: int, p: int, device: torch.device, w_ring=3.0, w_l
     return w
 
 
-def loss_flow(v_pred, v_star, token_mask, w_res=None, atom_mask=None):
-    if v_pred.dim() == 5:
-        mask = token_mask[:, None, :, None, None].float()
-    else:
-        mask = token_mask[:, None, :, None].float()
-    if atom_mask is not None:
-        mask = mask * atom_mask[:, None, :, :, None].float()
-    diff2 = (v_pred - v_star) ** 2
-    if w_res is not None:
-        if w_res.dim() == 1:
-            w_ = w_res[None, None, :, None]
+def _masked_mse_per_coord(x_pred, x_true, token_mask, w_res=None, atom_mask=None, eps: float = 1e-8):
+    if x_pred.dim() == 5:
+        B, Ns, L, A, _C = x_pred.shape
+        m = token_mask[:, None, :, None].float()
+        if atom_mask is None:
+            am = torch.ones((B, L, A), device=x_pred.device, dtype=torch.float32)
         else:
-            w_ = w_res[:, None, :, None]
-        if diff2.dim() == 5:
-            w_ = w_[:, :, :, None, None]
-        diff2 = diff2 * w_
-    return (diff2 * mask).sum() / (mask.sum() * 3.0 + 1e-8)
+            am = atom_mask.float()
+        m = (m * am[:, None, :, :]).expand(B, Ns, L, A)
+        if w_res is not None:
+            w = w_res
+            if w.dim() == 1:
+                w = w[None, :].expand(B, L)
+            m = m * w[:, None, :, None].float()
+        diff2 = (x_pred - x_true).pow(2).sum(dim=-1)
+        denom = m.sum()
+        return (diff2 * m).sum() / (denom * 3.0 * Ns + eps)
+
+    if x_pred.dim() == 4:
+        B, d1, d2, _C = x_pred.shape
+        if d1 == token_mask.shape[1]:
+            L, A = d1, d2
+            m = token_mask[:, :, None].float()
+            if atom_mask is None:
+                am = torch.ones((B, L, A), device=x_pred.device, dtype=torch.float32)
+            else:
+                am = atom_mask.float()
+            m = m * am
+            if w_res is not None:
+                w = w_res
+                if w.dim() == 1:
+                    w = w[None, :].expand(B, L)
+                m = m * w[:, :, None].float()
+            diff2 = (x_pred - x_true).pow(2).sum(dim=-1)
+            denom = m.sum()
+            return (diff2 * m).sum() / (denom * 3.0 + eps)
+        else:
+            Ns, L = d1, d2
+            m = token_mask[:, None, :].float().expand(B, Ns, L)
+            if atom_mask is not None and atom_mask.dim() == 2:
+                m = m * atom_mask[:, None, :].float()
+            if w_res is not None:
+                w = w_res
+                if w.dim() == 1:
+                    w = w[None, :].expand(B, L)
+                m = m * w[:, None, :].float()
+            diff2 = (x_pred - x_true).pow(2).sum(dim=-1)
+            denom = m.sum()
+            return (diff2 * m).sum() / (denom * 3.0 + eps)
+
+    if x_pred.dim() == 3:
+        B, L, _C = x_pred.shape
+        m = token_mask.float()
+        if atom_mask is not None and atom_mask.dim() == 2:
+            m = m * atom_mask.float()
+        if w_res is not None:
+            w = w_res
+            if w.dim() == 1:
+                w = w[None, :].expand(B, L)
+            m = m * w.float()
+        diff2 = (x_pred - x_true).pow(2).sum(dim=-1)
+        denom = m.sum()
+        return (diff2 * m).sum() / (denom * 3.0 + eps)
+
+    raise ValueError(f"Unsupported tensor shape for masked MSE: {tuple(x_pred.shape)}")
+
+
+def _weighted_rigid_align(
+    x: torch.Tensor,
+    x_target: torch.Tensor,
+    atom_weight: torch.Tensor,
+    stop_gradient: bool = True,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    if stop_gradient:
+        with torch.no_grad():
+            return _weighted_rigid_align(x, x_target, atom_weight, stop_gradient=False, eps=eps).detach()
+
+    w = atom_weight.float()
+    w_sum = w.sum(dim=-1, keepdim=True).clamp(min=eps)
+    x_centroid = (x * w[..., None]).sum(dim=-2, keepdim=True) / w_sum[..., None]
+    y_centroid = (x_target * w[..., None]).sum(dim=-2, keepdim=True) / w_sum[..., None]
+    x0 = x - x_centroid
+    y0 = x_target - y_centroid
+    h = torch.matmul((x0 * w[..., None]).transpose(-2, -1), y0)
+    u, _s, vh = torch.linalg.svd(h)
+    v = vh.transpose(-2, -1)
+    ut = u.transpose(-2, -1)
+    det = torch.linalg.det(torch.matmul(v, ut))
+    diag = torch.stack([torch.ones_like(det), torch.ones_like(det), det], dim=-1)
+    r = torch.matmul(v, torch.matmul(torch.diag_embed(diag).to(v.device), ut))
+    x_aligned = torch.matmul(x0, r.transpose(-2, -1)) + y_centroid
+    return x_aligned
+
+
+def _align_true_to_pred(
+    x_pred: torch.Tensor,
+    x_true: torch.Tensor,
+    token_mask: torch.Tensor,
+    w_res: torch.Tensor | None = None,
+    atom_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if x_pred.dim() != 5:
+        raise ValueError(f"Expected x_pred dim=5, got shape {tuple(x_pred.shape)}")
+    B, Ns, L, A, _ = x_pred.shape
+    if atom_mask is None:
+        am = torch.ones((B, L, A), device=x_pred.device, dtype=torch.float32)
+    else:
+        am = atom_mask.float()
+    w = token_mask[:, None, :, None].float() * am[:, None, :, :]
+    if w_res is not None:
+        w_local = w_res
+        if w_local.dim() == 1:
+            w_local = w_local[None, :].expand(B, L)
+        w = w * w_local[:, None, :, None].float()
+    x_pred_f = x_pred.reshape(B, Ns, L * A, 3)
+    x_true_f = x_true.reshape(B, Ns, L * A, 3)
+    w_f = w.reshape(B, Ns, L * A)
+    x_true_aligned = _weighted_rigid_align(x_true_f, x_pred_f, w_f, stop_gradient=True)
+    return x_true_aligned.reshape(B, Ns, L, A, 3)
+
+
+def loss_ca_adj(x1_pred, x1_true, token_mask, w_res=None, atom_mask=None, eps: float = 1e-8):
+    if x1_pred.dim() != 5:
+        raise ValueError(f"Expected x1_pred dim=5, got shape {tuple(x1_pred.shape)}")
+    B, Ns, L, _A, _C = x1_pred.shape
+    if L < 2:
+        return x1_pred.new_tensor(0.0)
+    if atom_mask is None:
+        ca_ok = token_mask
+    else:
+        ca_ok = token_mask & atom_mask[:, :, ATOM_CA].bool()
+    m = (ca_ok[:, None, :-1] & ca_ok[:, None, 1:]).float()
+    if w_res is not None:
+        w = w_res
+        if w.dim() == 1:
+            w = w[None, :].expand(B, L)
+        w_pair = 0.5 * (w[:, :-1] + w[:, 1:])
+        m = m * w_pair[:, None, :].float()
+    x_pred_ca = x1_pred[..., ATOM_CA, :]
+    x_true_ca = x1_true[..., ATOM_CA, :]
+    d_pred = torch.linalg.vector_norm(x_pred_ca[:, :, 1:, :] - x_pred_ca[:, :, :-1, :], dim=-1)
+    d_true = torch.linalg.vector_norm(x_true_ca[:, :, 1:, :] - x_true_ca[:, :, :-1, :], dim=-1)
+    diff2 = (d_pred - d_true).pow(2)
+    denom = m.sum().clamp(min=1.0)
+    return (diff2 * m).sum() / (denom + eps)
+
+
+def loss_smooth_lddt_ca(
+    x_pred_ca: torch.Tensor,
+    x_true_ca: torch.Tensor,
+    token_mask: torch.Tensor,
+    cutoff: float = 15.0,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    if x_pred_ca.dim() != 4 or x_true_ca.dim() != 4:
+        raise ValueError(
+            f"Expected x_pred_ca/x_true_ca shape [B,Ns,L,3], got {tuple(x_pred_ca.shape)} / {tuple(x_true_ca.shape)}"
+        )
+    B, Ns, L, _C = x_pred_ca.shape
+    if L < 2:
+        return x_pred_ca.new_tensor(0.0)
+
+    mask = token_mask.float()
+    xi = x_pred_ca[:, :, :, None, :]
+    xj = x_pred_ca[:, :, None, :, :]
+    yi = x_true_ca[:, :, :, None, :]
+    yj = x_true_ca[:, :, None, :, :]
+    d_pred = torch.linalg.vector_norm(xi - xj, dim=-1)
+    d_true = torch.linalg.vector_norm(yi - yj, dim=-1)
+
+    eye = torch.eye(L, device=x_pred_ca.device).bool()
+    valid = (mask[:, None, :, None] * mask[:, None, None, :]).bool()
+    valid = valid & (~eye[None, None, :, :])
+    valid = valid & (d_true < cutoff)
+
+    diff = torch.abs(d_pred - d_true)
+    score = (
+        (torch.sigmoid(0.5 - diff) + torch.sigmoid(1.0 - diff) + torch.sigmoid(2.0 - diff) + torch.sigmoid(4.0 - diff))
+        / 4.0
+    )
+    num = (score * valid.float()).sum()
+    denom = valid.float().sum().clamp(min=1.0)
+    lddt = num / (denom + eps)
+    return 1.0 - lddt
+
+
+def _frame_from_n_ca_c(x_bb: torch.Tensor, eps: float = 1e-8) -> tuple[torch.Tensor, torch.Tensor]:
+    n = x_bb[..., ATOM_N, :]
+    ca = x_bb[..., ATOM_CA, :]
+    c = x_bb[..., ATOM_C, :]
+    e1 = c - ca
+    e1 = e1 / (torch.linalg.vector_norm(e1, dim=-1, keepdim=True) + eps)
+    u2 = n - ca
+    u2 = u2 - (u2 * e1).sum(dim=-1, keepdim=True) * e1
+    e2 = u2 / (torch.linalg.vector_norm(u2, dim=-1, keepdim=True) + eps)
+    e3 = torch.linalg.cross(e1, e2, dim=-1)
+    e3 = e3 / (torch.linalg.vector_norm(e3, dim=-1, keepdim=True) + eps)
+    R = torch.stack([e1, e2, e3], dim=-1)
+    t = ca
+    return R, t
+
+
+def loss_fape_ca(
+    x1_pred: torch.Tensor,
+    x1_true: torch.Tensor,
+    token_mask: torch.Tensor,
+    w_res: torch.Tensor | None = None,
+    atom_mask: torch.Tensor | None = None,
+    clamp: float = 10.0,
+    chunk: int = 64,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    if x1_pred.dim() != 5 or x1_true.dim() != 5:
+        raise ValueError(f"Expected x1_pred/x1_true [B,Ns,L,A,3], got {tuple(x1_pred.shape)} / {tuple(x1_true.shape)}")
+    B, Ns, L, A, _C = x1_pred.shape
+    if L < 2:
+        return x1_pred.new_tensor(0.0)
+    if A <= ATOM_C:
+        return x1_pred.new_tensor(0.0)
+
+    if atom_mask is None:
+        am = torch.ones((B, L, A), device=x1_pred.device, dtype=torch.bool)
+    else:
+        am = atom_mask.bool()
+    frame_ok = token_mask & am[:, :, ATOM_N] & am[:, :, ATOM_CA] & am[:, :, ATOM_C]
+    pt_ok = token_mask & am[:, :, ATOM_CA]
+
+    R_pred, t_pred = _frame_from_n_ca_c(x1_pred[..., :4, :], eps=eps)
+    R_true, t_true = _frame_from_n_ca_c(x1_true[..., :4, :], eps=eps)
+
+    p_pred = x1_pred[..., ATOM_CA, :]
+    p_true = x1_true[..., ATOM_CA, :]
+
+    total = x1_pred.new_tensor(0.0)
+    denom = x1_pred.new_tensor(0.0)
+    wj = pt_ok[:, None, :].float()
+    if w_res is not None:
+        w = w_res
+        if w.dim() == 1:
+            w = w[None, :].expand(B, L)
+        wj = wj * w[:, None, :].float()
+
+    for i0 in range(0, L, int(chunk)):
+        i1 = min(L, i0 + int(chunk))
+        ok_i = frame_ok[:, i0:i1].float()
+        if w_res is not None:
+            ok_i = ok_i * w[:, i0:i1].float()
+        ok_i = ok_i[:, None, :, None]
+
+        tp = t_pred[:, :, i0:i1, :]
+        tt = t_true[:, :, i0:i1, :]
+        Rp = R_pred[:, :, i0:i1, :, :]
+        Rt = R_true[:, :, i0:i1, :, :]
+
+        pred_local = torch.einsum("bnilj,bnijk->bnilk", p_pred[:, :, None, :, :] - tp[:, :, :, None, :], Rp)
+        true_local = torch.einsum("bnilj,bnijk->bnilk", p_true[:, :, None, :, :] - tt[:, :, :, None, :], Rt)
+        diff = pred_local - true_local
+        err = torch.linalg.vector_norm(diff, dim=-1)
+        if float(clamp) > 0:
+            err = torch.clamp(err, max=float(clamp))
+        w_pair = ok_i * wj[:, :, None, :]
+        total = total + (err.pow(2) * w_pair).sum()
+        denom = denom + w_pair.sum()
+
+    return total / (denom.clamp(min=1.0) + eps)
+
+
+def loss_flow(v_pred, v_star, token_mask, w_res=None, atom_mask=None):
+    return _masked_mse_per_coord(v_pred, v_star, token_mask, w_res=w_res, atom_mask=atom_mask)
 
 
 def loss_bb(x1_pred, x1_true, token_mask, w_res=None, atom_mask=None):
-    if x1_pred.dim() == 5:
-        mask = token_mask[:, None, :, None, None].float()
-    else:
-        mask = token_mask[:, None, :, None].float()
-    if atom_mask is not None:
-        mask = mask * atom_mask[:, None, :, :, None].float()
-    diff2 = (x1_pred - x1_true) ** 2
-    if w_res is not None:
-        if w_res.dim() == 1:
-            w_ = w_res[None, None, :, None]
+    if os.environ.get("LASSODIFF_ALIGN_BB", "1") == "1" and x1_pred.dim() == 5:
+        x1_true = _align_true_to_pred(x1_pred, x1_true, token_mask, w_res=w_res, atom_mask=atom_mask)
+    return _masked_mse_per_coord(x1_pred, x1_true, token_mask, w_res=w_res, atom_mask=atom_mask)
+
+
+def loss_bond_bb(x, token_mask, atom_mask=None):
+    parts = loss_bond_bb_parts(x, token_mask, atom_mask=atom_mask)
+    return parts["loss"]
+
+
+def loss_bond_bb_parts(x, token_mask, atom_mask=None):
+    if x.dim() == 5:
+        tok = token_mask[:, None, :].bool()
+        if atom_mask is None:
+            am = tok[:, :, :, None].expand(-1, x.shape[1], -1, x.shape[3])
         else:
-            w_ = w_res[:, None, :, None]
-        if diff2.dim() == 5:
-            w_ = w_[:, :, :, None, None]
-        diff2 = diff2 * w_
-    return (diff2 * mask).sum() / (mask.sum() * 3.0 + 1e-8)
+            am = atom_mask[:, None, :, :].bool()
+    else:
+        tok = token_mask.bool()
+        if atom_mask is None:
+            am = tok[:, :, None].expand(-1, -1, x.shape[2])
+        else:
+            am = atom_mask.bool()
+
+    def _pair(res_a, atom_a, res_b, atom_b, target):
+        pa = x[..., res_a, atom_a, :]
+        pb = x[..., res_b, atom_b, :]
+        d = torch.linalg.vector_norm(pa - pb, dim=-1)
+        if x.dim() == 5:
+            ok = tok[..., res_a] & tok[..., res_b] & am[..., res_a, atom_a] & am[..., res_b, atom_b]
+        else:
+            ok = tok[:, res_a] & tok[:, res_b] & am[:, res_a, atom_a] & am[:, res_b, atom_b]
+        ok_f = ok.float()
+        return ((d - target) ** 2) * ok_f, ok_f
+
+    B = x.shape[0]
+    L = x.shape[2] if x.dim() == 5 else x.shape[1]
+    dev = x.device
+    idx = torch.arange(L, device=dev)
+    idx_next = idx + 1
+    valid = idx_next < L
+    idx = idx[valid]
+    idx_next = idx_next[valid]
+    if idx.numel() == 0:
+        z = x.new_tensor(0.0)
+        return {
+            "loss": z,
+            "nca": z,
+            "cac": z,
+            "co": z,
+            "cn": z,
+            "nca_pairs": z,
+            "cac_pairs": z,
+            "co_pairs": z,
+            "cn_pairs": z,
+        }
+
+    l1, m1 = _pair(idx, ATOM_N, idx, ATOM_CA, 1.46)
+    l2, m2 = _pair(idx, ATOM_CA, idx, ATOM_C, 1.52)
+    l3, m3 = _pair(idx, ATOM_C, idx, ATOM_O, 1.23)
+    l4, m4 = _pair(idx, ATOM_C, idx_next, ATOM_N, 1.33)
+    denom1 = m1.sum().clamp(min=1.0)
+    denom2 = m2.sum().clamp(min=1.0)
+    denom3 = m3.sum().clamp(min=1.0)
+    denom4 = m4.sum().clamp(min=1.0)
+
+    p1 = l1.sum() / denom1
+    p2 = l2.sum() / denom2
+    p3 = l3.sum() / denom3
+    p4 = l4.sum() / denom4
+
+    loss = (l1.sum() + l2.sum() + l3.sum() + l4.sum()) / (m1.sum() + m2.sum() + m3.sum() + m4.sum()).clamp(min=1.0)
+
+    return {
+        "loss": loss,
+        "nca": p1,
+        "cac": p2,
+        "co": p3,
+        "cn": p4,
+        "nca_pairs": m1.sum(),
+        "cac_pairs": m2.sum(),
+        "co_pairs": m3.sum(),
+        "cn_pairs": m4.sum(),
+    }
+
+
+def loss_angle_bb(x, token_mask, atom_mask=None):
+    if x.dim() == 5:
+        tok = token_mask[:, None, :].bool()
+        if atom_mask is None:
+            am = tok[:, :, :, None].expand(-1, x.shape[1], -1, x.shape[3])
+        else:
+            am = atom_mask[:, None, :, :].bool()
+    else:
+        tok = token_mask.bool()
+        if atom_mask is None:
+            am = tok[:, :, None].expand(-1, -1, x.shape[2])
+        else:
+            am = atom_mask.bool()
+
+    def _trip(res_a, atom_a, res_b, atom_b, res_c, atom_c, target_deg):
+        pa = x[..., res_a, atom_a, :]
+        pb = x[..., res_b, atom_b, :]
+        pc = x[..., res_c, atom_c, :]
+
+        # Use cosine similarity directly for stability and bounded loss
+        # target_deg is in degrees. Convert to radians.
+        target_rad = torch.tensor(target_deg * torch.pi / 180.0, device=dev)
+
+        # Calculate angle (0 to pi)
+        # We can implement _angle_rad or just use _angle * pi / 180
+        # But let's reuse _angle for now and convert
+        deg = _angle(pa, pb, pc)
+        rad = deg * torch.pi / 180.0
+
+        # Loss: 1 - cos(rad - target_rad)
+        loss_val = 1.0 - torch.cos(rad - target_rad)
+
+        if x.dim() == 5:
+            ok = (
+                tok[..., res_a]
+                & tok[..., res_b]
+                & tok[..., res_c]
+                & am[..., res_a, atom_a]
+                & am[..., res_b, atom_b]
+                & am[..., res_c, atom_c]
+            )
+        else:
+            ok = (
+                tok[:, res_a]
+                & tok[:, res_b]
+                & tok[:, res_c]
+                & am[:, res_a, atom_a]
+                & am[:, res_b, atom_b]
+                & am[:, res_c, atom_c]
+            )
+        ok_f = ok.float()
+        return loss_val * ok_f, ok_f
+
+    B = x.shape[0]
+    L = x.shape[2] if x.dim() == 5 else x.shape[1]
+    dev = x.device
+    idx = torch.arange(L, device=dev)
+    idx_next = idx + 1
+    valid = idx_next < L
+    idx = idx[valid]
+    idx_next = idx_next[valid]
+    if idx.numel() == 0:
+        return x.new_tensor(0.0)
+
+    # N-CA-C: 111.2
+    l1, m1 = _trip(idx, ATOM_N, idx, ATOM_CA, idx, ATOM_C, 111.2)
+    # CA-C-N: 116.2
+    l2, m2 = _trip(idx, ATOM_CA, idx, ATOM_C, idx_next, ATOM_N, 116.2)
+    # C-N-CA: 121.7
+    l3, m3 = _trip(idx, ATOM_C, idx_next, ATOM_N, idx_next, ATOM_CA, 121.7)
+    # CA-C-O: 120.8 (Planar carbonyl)
+    l4, m4 = _trip(idx, ATOM_CA, idx, ATOM_C, idx, ATOM_O, 120.8)
+
+    loss = l1.sum() + l2.sum() + l3.sum() + l4.sum()
+    denom = (m1.sum() + m2.sum() + m3.sum() + m4.sum()).clamp(min=1.0)
+    return loss / denom
+
+
+def _dihedral(a, b, c, d, eps=1e-8):
+    b0 = -1.0 * (b - a)
+    b1 = c - b
+    b2 = d - c
+
+    b1 = b1 / (torch.linalg.vector_norm(b1, dim=-1, keepdim=True) + eps)
+
+    v = b0 - (b0 * b1).sum(dim=-1, keepdim=True) * b1
+    w = b2 - (b2 * b1).sum(dim=-1, keepdim=True) * b1
+
+    x = (v * w).sum(dim=-1)
+    y = (torch.linalg.cross(b1, v) * w).sum(dim=-1)
+
+    return torch.atan2(y, x)
+
+
+def loss_dihedral_bb(x, token_mask, atom_mask=None):
+    if x.dim() == 5:
+        tok = token_mask[:, None, :].bool()
+        if atom_mask is None:
+            am = tok[:, :, :, None].expand(-1, x.shape[1], -1, x.shape[3])
+        else:
+            am = atom_mask[:, None, :, :].bool()
+    else:
+        tok = token_mask.bool()
+        if atom_mask is None:
+            am = tok[:, :, None].expand(-1, -1, x.shape[2])
+        else:
+            am = atom_mask.bool()
+
+    def _quad(res_a, atom_a, res_b, atom_b, res_c, atom_c, res_d, atom_d, target_rad):
+        pa = x[..., res_a, atom_a, :]
+        pb = x[..., res_b, atom_b, :]
+        pc = x[..., res_c, atom_c, :]
+        pd = x[..., res_d, atom_d, :]
+
+        torsion = _dihedral(pa, pb, pc, pd)
+        loss_val = 1.0 - torch.cos(torsion - target_rad)
+
+        if x.dim() == 5:
+            ok = (
+                tok[..., res_a]
+                & tok[..., res_b]
+                & tok[..., res_c]
+                & tok[..., res_d]
+                & am[..., res_a, atom_a]
+                & am[..., res_b, atom_b]
+                & am[..., res_c, atom_c]
+                & am[..., res_d, atom_d]
+            )
+        else:
+            ok = (
+                tok[:, res_a]
+                & tok[:, res_b]
+                & tok[:, res_c]
+                & tok[:, res_d]
+                & am[:, res_a, atom_a]
+                & am[:, res_b, atom_b]
+                & am[:, res_c, atom_c]
+                & am[:, res_d, atom_d]
+            )
+        ok_f = ok.float()
+        return loss_val * ok_f, ok_f
+
+    B = x.shape[0]
+    L = x.shape[2] if x.dim() == 5 else x.shape[1]
+    dev = x.device
+    idx = torch.arange(L, device=dev)
+    idx_next = idx + 1
+    valid = idx_next < L
+    idx = idx[valid]
+    idx_next = idx_next[valid]
+    if idx.numel() == 0:
+        return x.new_tensor(0.0)
+
+    # Omega: CA_i, C_i, N_{i+1}, CA_{i+1} -> 180 deg (pi rad)
+    l1, m1 = _quad(idx, ATOM_CA, idx, ATOM_C, idx_next, ATOM_N, idx_next, ATOM_CA, torch.pi)
+
+    loss = l1.sum()
+    denom = m1.sum().clamp(min=1.0)
+    return loss / denom
 
 
 def loss_iso_ca(x1_pred, k_ring_end, token_mask, iso_cfg: IsoCfg = IsoCfg()):
