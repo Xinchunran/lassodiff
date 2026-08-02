@@ -214,7 +214,14 @@ def main():
         x0 = torch.zeros_like(batch["core"])
         for b, condition in enumerate(batch["conditions"]):
             mode = sample_prior_mode(generator)
-            prior = sample_peptide_prior(condition, mode=mode, generator=generator)
+            try:
+                prior = sample_peptide_prior(condition, mode=mode, generator=generator)
+            except Exception as exc:
+                raise RuntimeError(
+                    "procedural prior failed for "
+                    f"rank={rank}, step={step}, batch_index={b}, mode={mode}, "
+                    f"sequence={condition.sequence}, k={condition.k}, p={condition.p}"
+                ) from exc
             x0[b, 0, :len(condition.sequence)] = prior.coordinates
         aa_ids = batch["aa_ids"].to(device, non_blocking=True)
         token_mask = batch["token_mask"].to(device, non_blocking=True)

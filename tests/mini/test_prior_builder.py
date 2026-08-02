@@ -47,6 +47,20 @@ def test_corrupted_prior_can_create_zero_and_multiple_crossings():
     assert _topology(multiple, candidate).crossing_count.item() >= 2
 
 
+def test_edge_grazing_prior_preserves_reconstructable_ca_steps():
+    # A larger ring makes a post-hoc radial plug move especially destructive.
+    # The corruption must remain a physical peptide trace before reconstruction.
+    candidate = CandidateCondition("AAAAAAAAAAAADEAAAA", 12, 15)
+    sample = sample_peptide_prior(
+        candidate, mode="topology_corrupted", corruption="edge_grazing", noise_scale=0,
+    )
+    ca = sample.coordinates[:, ATOM_CA]
+    steps = (ca[1:] - ca[:-1]).norm(dim=-1)
+    assert bool(((steps >= 2.4) & (steps <= 4.5)).all())
+    peptide = (sample.coordinates[:-1, ATOM_C] - sample.coordinates[1:, ATOM_N]).norm(dim=-1)
+    assert torch.allclose(peptide, torch.full_like(peptide, 1.329), atol=2e-4)
+
+
 def test_prior_uses_no_template_coordinates(monkeypatch):
     import lassodiff.pdb_utils as pdb_utils
     monkeypatch.setattr(pdb_utils, "parse_pdb_residues", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("PDB read")))

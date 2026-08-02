@@ -131,7 +131,10 @@ def _topological_ca_trace(candidate: CandidateCondition, corruption: str | None)
     else:
         crossing_start = p
     pre_steps = crossing_start - k
-    inside_fraction = .42
+    # Edge-grazing is part of the endpoint geometry, not a post-hoc move of
+    # the plug.  Moving the plug after `_bridge` was built could stretch the
+    # final CA--CA segment well beyond peptide geometry for larger rings.
+    inside_fraction = .96 if corruption == "edge_grazing" else .42
     radial_step = float(((1.0 - inside_fraction) * edge).norm())
     if pre_steps == 1 and radial_step >= CA_TRACE_SPACING:
         inside_fraction = 1.0 - 3.2 / float(edge.norm())
@@ -150,8 +153,6 @@ def _topological_ca_trace(candidate: CandidateCondition, corruption: str | None)
             ca[index, 2] = max(float(ca[index, 2]), plug_z)
         return ca
 
-    if corruption == "edge_grazing":
-        ca[crossing_start] = ring_center + .96 * edge + torch.tensor([0.0, 0.0, plug_z])
     below = ca[crossing_start].clone()
     below[2] = -plug_z
     horizontal = math.sqrt(CA_TRACE_SPACING**2 - (2 * plug_z)**2)
