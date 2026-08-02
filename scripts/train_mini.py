@@ -5,10 +5,12 @@ from __future__ import annotations
 import argparse
 import atexit
 from datetime import datetime, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
 import signal
+import subprocess
 import sys
 
 import torch
@@ -58,10 +60,6 @@ def _distributed_device(requested: str):
     return device, rank, world_size, local_rank
 
 
-def _unwrap(module):
-    return module.module if isinstance(module, FSDP) else module
-
-
 def _reduce_metrics(values, batch_size, device, world_size):
     packed = torch.tensor([*(float(value.detach()) * batch_size for value in values), batch_size], device=device)
     if world_size > 1:
@@ -69,7 +67,7 @@ def _reduce_metrics(values, batch_size, device, world_size):
     return [float(value / packed[-1].clamp_min(1)) for value in packed[:-1]], int(packed[-1])
 
 
-def _save_checkpoint(path, *, system, optimizer, step, report, world_size, rank):
+def _save_checkpoint(path, *, system, optimizer, step, report, world_size, rank, provenance):
     if isinstance(system, FSDP):
         state_config = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
         optimizer_config = FullOptimStateDictConfig(offload_to_cpu=True, rank0_only=True)
@@ -86,7 +84,7 @@ def _save_checkpoint(path, *, system, optimizer, step, report, world_size, rank)
             "architecture_id": ARCHITECTURE_ID_MINI, "system": model_state,
             "optimizer": optimizer_state, "step": int(step),
             "world_size": int(world_size), "distributed_backend": "fsdp_full_shard" if world_size > 1 else "none",
-            "preflight": report,
+            "preflight": report, "provenance": provenance,
         }, path)
 
 
@@ -111,6 +109,12 @@ def main():
     if args.steps < 1 or args.batch_size < 1 or args.log_every < 1 or args.save_every < 1:
         raise ValueError("steps, batch-size, log-every and save-every must be positive")
     report = _require_preflight(Path(args.preflight))
+    source_commit = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=Path(__file__).resolve().parents[1], text=True,
+    ).strip()
+    if len(source_commit) != 40:
+        raise RuntimeError("cannot resolve a full source commit for Mini training")
+    preflight_sha256 = hashlib.sha256(Path(args.preflight).read_bytes()).hexdigest()
     device, rank, world_size, local_rank = _distributed_device(args.device)
     torch.manual_seed(args.seed + rank * 100003)
     if device.type == "cuda":
@@ -143,6 +147,12 @@ def main():
     generator = torch.Generator().manual_seed(args.seed + rank * 100003)
     run_dir = Path(args.run_dir)
     run_state = {"completed": False, "step": 0}
+    provenance = {
+        "source_commit": source_commit,
+        "preflight_sha256": preflight_sha256,
+        "dataset_mapping_sha256": dataset.mapping_sha256,
+        "seed": args.seed,
+    }
     if rank == 0:
         if run_dir.exists() and any(run_dir.iterdir()):
             raise FileExistsError(f"refusing to overwrite non-empty run directory: {run_dir}")
@@ -158,6 +168,8 @@ def main():
             "qualified_example_count": len(dataset),
             "rejected_example_count": len(dataset.rejections),
             "dataset_mapping_sha256": dataset.mapping_sha256,
+            "source_commit": source_commit,
+            "preflight_sha256": preflight_sha256,
             "preflight": str(Path(args.preflight).resolve()),
             "command": [sys.executable, *sys.argv],
             "cuda_devices": [torch.cuda.get_device_name(index) for index in range(torch.cuda.device_count())] if device.type == "cuda" else [],
@@ -230,12 +242,17 @@ def main():
                 (output.total, output.core, output.sidechain, output.refine, output.viability), B, device, world_size,
             )
             row = {
-                "event": "train", "step": step, "world_size": world_size,
+                "event": "train", "architecture_id": ARCHITECTURE_ID_MINI,
+                "distributed_backend": "fsdp_full_shard" if world_size > 1 else "none",
+                "source_commit": source_commit, "preflight_sha256": preflight_sha256,
+                "dataset_mapping_sha256": dataset.mapping_sha256, "seed": args.seed,
+                "step": step, "world_size": world_size,
                 "global_sample_count": global_samples,
                 "total": reduced[0], "core": reduced[1], "sidechain": reduced[2],
                 "refine": reduced[3], "viability": reduced[4],
             }
-            if not all(torch.isfinite(torch.tensor(value)) for key, value in row.items() if key not in {"event", "step", "world_size", "global_sample_count"}):
+            numeric_metric_keys = ("total", "core", "sidechain", "refine", "viability")
+            if not all(torch.isfinite(torch.tensor(row[key])) for key in numeric_metric_keys):
                 raise RuntimeError("non-finite Mini training metric")
             if rank == 0:
                 encoded = json.dumps(row, sort_keys=True, allow_nan=False)
@@ -247,10 +264,12 @@ def main():
             _save_checkpoint(
                 run_dir / f"checkpoint-{step:08d}.pt", system=system, optimizer=optimizer,
                 step=step, report=report, world_size=world_size, rank=rank,
+                provenance=provenance,
             )
     _save_checkpoint(
         run_dir / "checkpoint-final.pt", system=system, optimizer=optimizer,
         step=args.steps, report=report, world_size=world_size, rank=rank,
+        provenance=provenance,
     )
     if rank == 0:
         _write_json(run_dir / "train_status.json", {"status": "COMPLETE", "step": args.steps, "world_size": world_size})
