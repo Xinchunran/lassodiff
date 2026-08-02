@@ -40,8 +40,8 @@ SIDECHAIN_PARENT = {
 
 CHI_ATOMS = {
     "R": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "CD"), ("CB", "CG", "CD", "NE"), ("CG", "CD", "NE", "CZ")),
-    "N": (("N", "CA", "CB", "CG"),), "D": (("N", "CA", "CB", "CG"),), "Q": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "CD")),
-    "E": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "CD")), "H": (("N", "CA", "CB", "CG"),),
+    "N": (("N", "CA", "CB", "CG"),), "D": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "OD1")), "Q": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "CD")),
+    "E": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "CD"), ("CB", "CG", "CD", "OE1")), "H": (("N", "CA", "CB", "CG"),),
     "I": (("N", "CA", "CB", "CG1"),), "L": (("N", "CA", "CB", "CG"),), "K": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "CD"), ("CB", "CG", "CD", "CE"), ("CG", "CD", "CE", "NZ")),
     "M": (("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "SD")), "P": (("N", "CA", "CB", "CG"),),
     "F": (("N", "CA", "CB", "CG"),), "W": (("N", "CA", "CB", "CG"),), "Y": (("N", "CA", "CB", "CG"),), "C": (("N", "CA", "CB", "SG"),),

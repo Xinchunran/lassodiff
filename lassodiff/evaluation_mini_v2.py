@@ -6,6 +6,23 @@ REQUIRED_SYSTEMS = REQUIRED_BASELINE_KEYS
 REQUIRED_SAMPLE_FIELDS = frozenset({"finite", "strict_valid", "backbone_valid", "formed_geometry", "crossing_count", "plug_match", "tail_persistence", "clash_valid", "ca_rmsd_best_target", "lddt_best_target"})
 
 
+def evaluate_rollout_samples(core_samples, target_core, target_mask, candidate):
+    """Evaluate every generated sample through the strict checker."""
+    import torch
+    from .metrics_mini_v2 import best_ca_rmsd, lddt_score
+    rows = []
+    valid_targets = target_core[target_mask.any(dim=(-1, -2))] if target_mask.ndim == 3 else target_core
+    best = best_ca_rmsd(core_samples, valid_targets)
+    for sample in core_samples:
+        ca = sample[:, 1, :]
+        target_ca = valid_targets[:, :, 1, :]
+        lddt = max(float(lddt_score(ca, t)) for t in target_ca) if len(target_ca) else 0.0
+        mask = torch.ones(sample.shape[:-1], dtype=torch.bool, device=sample.device)
+        rows.append(evaluate_generated_candidate(sample, mask, candidate,
+                                                  ca_rmsd_best_target=float(best), lddt_best_target=lddt))
+    return rows
+
+
 def evaluate_generated_candidate(core_coordinates, core_atom_mask, candidate, *, atom14_coordinates=None,
                                  atom14_atom_mask=None, ca_rmsd_best_target=None, lddt_best_target=None) -> dict:
     """Build the required sample row through the unchanged authoritative checker."""

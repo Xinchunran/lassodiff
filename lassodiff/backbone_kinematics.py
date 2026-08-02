@@ -64,33 +64,51 @@ def build_core_from_torsions(sequence: str, phi: torch.Tensor, psi: torch.Tensor
     core = torch.zeros((length, 7, 3), dtype=dtype, device=device)
     core[0, ATOM_N] = torch.tensor([0.0, 0.0, 0.0], dtype=dtype, device=device)
     core[0, ATOM_CA] = torch.tensor([BOND_N_CA, 0.0, 0.0], dtype=dtype, device=device)
-    # The initial frame includes the endpoint torsions so every state slot has
-    # a differentiable route into the decoded chain without changing lengths.
-    initial_rotation = 0.05 * (torch.sin(phi[0]) + torch.sin(psi[-1]))
-    initial_angle = torch.as_tensor(math.radians(180.0 - 111.2), dtype=dtype, device=device) + initial_rotation
+    # The root frame is canonical. Undefined terminal torsions must not affect
+    # it; their state slots are masked by extract_backbone_torsions.
+    initial_angle = torch.as_tensor(math.radians(180.0 - 111.2), dtype=dtype, device=device)
     core[0, ATOM_C] = core[0, ATOM_CA] + BOND_CA_C * torch.stack((torch.cos(initial_angle), torch.sin(initial_angle), initial_angle * 0))
     for index in range(1, length):
         previous = core[index - 1]
         core[index, ATOM_N] = place_atom(previous[ATOM_N], previous[ATOM_CA], previous[ATOM_C],
                                          BOND_C_N, math.radians(116.2), psi[index - 1])
         core[index, ATOM_CA] = place_atom(previous[ATOM_CA], previous[ATOM_C], core[index, ATOM_N],
-                                          BOND_N_CA, math.radians(121.7), omega[index])
+                                          BOND_N_CA, math.radians(121.7), omega[index - 1])
         core[index, ATOM_C] = place_atom(previous[ATOM_C], core[index, ATOM_N], core[index, ATOM_CA],
                                          BOND_CA_C, math.radians(111.2), phi[index])
+    # Carbonyl O is placed in the local peptide plane; psi belongs to the
+    # following peptide bond and is not a carbonyl-O torsion.
     for index in range(length):
-        core[index, ATOM_O] = place_atom(core[index, ATOM_N], core[index, ATOM_CA], core[index, ATOM_C],
-                                         BOND_C_O, math.radians(120.8), psi[index])
+        core[index, ATOM_O] = place_atom(
+            core[index, ATOM_N], core[index, ATOM_CA], core[index, ATOM_C],
+            BOND_C_O, math.radians(120.8),
+            torch.as_tensor(torch.pi, dtype=dtype, device=device),
+        )
         if sequence[index] != "G":
             core[index, ATOM_CB] = _cb_from_backbone(core[index, ATOM_N], core[index, ATOM_CA], core[index, ATOM_C])
     return core
 
 
-def build_core_batch(sequences: list[str], torsions: torch.Tensor) -> torch.Tensor:
+def build_core_batch(sequences: list[str], torsions: torch.Tensor,
+                     token_mask: torch.Tensor | None = None) -> torch.Tensor:
     if torsions.ndim != 3 or torsions.shape[-1] != 3 or torsions.shape[0] != len(sequences):
         raise ValueError("torsions must have shape [B,L,3]")
-    return torch.stack([build_core_from_torsions(seq, torsions[b, :len(seq), 0],
-                                                  torsions[b, :len(seq), 1], torsions[b, :len(seq), 2])
-                        for b, seq in enumerate(sequences)])
+    B, Lmax, _ = torsions.shape
+    if token_mask is None:
+        token_mask = torch.zeros((B, Lmax), dtype=torch.bool, device=torsions.device)
+        for b, sequence in enumerate(sequences):
+            token_mask[b, :len(sequence)] = True
+    if token_mask.shape != (B, Lmax):
+        raise ValueError("token_mask must have shape [B,L]")
+    output = torsions.new_zeros((B, Lmax, 7, 3))
+    for b, sequence in enumerate(sequences):
+        length = len(sequence)
+        if length > Lmax or int(token_mask[b, :length].sum()) != length:
+            raise ValueError("token_mask does not contain a contiguous sequence prefix")
+        output[b, :length] = build_core_from_torsions(
+            sequence, torsions[b, :length, 0], torsions[b, :length, 1], torsions[b, :length, 2]
+        )
+    return output * token_mask[..., None, None].to(output.dtype)
 
 
 def _dihedral(a, b, c, d):
@@ -110,11 +128,14 @@ def extract_backbone_torsions(core: torch.Tensor, mask: torch.Tensor | None = No
     available = torch.ones((L, 7), dtype=torch.bool, device=core.device) if mask is None else mask.bool()
     for i in range(L):
         if i > 0:
-            output[i, 0] = _dihedral(core[i - 1, ATOM_C], core[i, ATOM_N], core[i, ATOM_CA], core[i, ATOM_C])
+            raw_phi = _dihedral(core[i - 1, ATOM_C], core[i, ATOM_N], core[i, ATOM_CA], core[i, ATOM_C])
+            output[i, 0] = torch.atan2(torch.sin(raw_phi - torch.pi), torch.cos(raw_phi - torch.pi))
             valid[i, 0] = bool(available[i - 1, ATOM_C] & available[i, ATOM_N] & available[i, ATOM_CA] & available[i, ATOM_C])
         if i + 1 < L:
-            output[i, 1] = _dihedral(core[i, ATOM_N], core[i, ATOM_CA], core[i, ATOM_C], core[i + 1, ATOM_N])
-            output[i, 2] = _dihedral(core[i, ATOM_CA], core[i, ATOM_C], core[i + 1, ATOM_N], core[i + 1, ATOM_CA])
+            raw_psi = _dihedral(core[i, ATOM_N], core[i, ATOM_CA], core[i, ATOM_C], core[i + 1, ATOM_N])
+            raw_omega = _dihedral(core[i, ATOM_CA], core[i, ATOM_C], core[i + 1, ATOM_N], core[i + 1, ATOM_CA])
+            output[i, 1] = torch.atan2(torch.sin(raw_psi + torch.pi), torch.cos(raw_psi + torch.pi))
+            output[i, 2] = torch.atan2(torch.sin(raw_omega + torch.pi), torch.cos(raw_omega + torch.pi))
             valid[i, 1] = bool(available[i, :4].all() & available[i + 1, ATOM_N])
             valid[i, 2] = bool(available[i, ATOM_CA] & available[i, ATOM_C] & available[i + 1, :2].all())
     return output, valid

@@ -127,6 +127,50 @@ python -m scripts.train_mini_cv \
 
 每个 fold 都使用其余四 folds 训练并在唯一 held-out fold 上记录 validation loss；test 不会被 loader 打开。split/source hash、fold、train/validation mapping hash 与 unavailable records 都进入 run manifest、每条 metrics 和 checkpoint provenance。
 
+短周期改进实验可从完整 checkpoint 恢复并显式选择 profile。`combined` 使用 strict checker 生成的质量 manifest，但 validation 仍是完整 held-out fold：
+
+```bash
+python scripts/build_mini_quality_manifest.py \
+  --metadata /path/to/lassopred.data.json --structure-root /path/to/structure \
+  --split data/mini_cv5_locked_test_v1.json --fold 0 \
+  --output artifacts/mini/quality_fold0_v1.json
+
+python scripts/train_mini.py ... --profile combined \
+  --quality-manifest artifacts/mini/quality_fold0_v1.json \
+  --resume-checkpoint /path/to/checkpoint.pt --steps 8500
+```
+
+profiles 为 `baseline`、`screening`、`structure`、`combined`。质量课程只改变训练采样，不加载 locked test。
+
+四卡 fail-fast 实验由一个顺序 launcher 管理：A/B/C/D 各先从 step 8000 运行 250 steps，随后四卡各评估一个 checkpoint；安全门和 construction/screening 等权早期信号最多选择两个改进分支，再与 baseline 各运行 250 steps。任何既无早期收益、又有 formed/backbone/clash、RMSD/lDDT 或 sampler 稳定性回退的分支不会继续。
+
+```bash
+python scripts/run_mini_fast_ablation.py \
+  --resume-checkpoint runs/.../checkpoint-00008000.pt \
+  --output-root runs/mini-fast-ablation-01
+```
+
+launcher 不调用 `scancel`、不覆盖非空目录，每个训练分支均通过 `torchrun --nproc-per-node=4` 使用同一组四卡。阶段决策分别写入 `stage1-selection.json` 与 `final-selection.json`。
+
+frame-v1 是独立 opt-in geometry path，旧 Cartesian checkpoint 只能通过显式 warm-start 加载共享 trunk；旧 score head 和 optimizer 不会加载。先校准当前 fold 的 train-only template，再用 500-step early gate：
+
+```bash
+python scripts/calibrate_backbone_template.py \
+  --metadata data/lassopred.data.json --structure-root Protenix/fine-tuning/structure \
+  --cv-split data/mini_cv5_locked_test_v1.json --fold 0 \
+  --output artifacts/mini/frame_template_fold0_v1.json
+
+python scripts/train_mini.py ... --geometry frame_v1 \
+  --frame-template artifacts/mini/frame_template_fold0_v1.json \
+  --frame-warm-start-checkpoint runs/.../checkpoint-00008000.pt \
+  --steps 500 --save-every 500 --validate-every 500
+
+python scripts/check_frame_early_stop.py \
+  --metrics runs/.../metrics.jsonl --step 500 --output runs/.../frame-early-decision.json
+```
+
+frame-v1 保持当前 Mini core-7 顺序 `N,CA,C,O,CB,CISO,OISO`，并使用独立 `sample_rectified_frame_flow`；legacy `sample_mini` 和最终 evaluator 不变。完整设计与保护边界见 `patch_frame.md`。
+
 FSDP 用一个统一 root 覆盖 core diffusion、sidechain、refiner 和 viability，并使用 `DistributedSampler` 与每-rank 独立 prior/noise seed。Full model/optimizer checkpoint 由所有 rank collective 汇集、仅 rank 0 写盘；日志和 status 也只有 rank 0 写。非空 run directory 会 fail closed，禁止多 rank 争写或覆盖历史任务。
 
 旧 Cartesian mini 的默认 prior 比例仅用于 legacy reproduction；新版生产训练 prior 为：
@@ -188,6 +232,11 @@ lassodiff/structure_processor.py     ASX/GLX 与 PDB 规范化
 lassodiff/internal_coordinates.py    无模板 internal-coordinate builder
 lassodiff/peptide_prior.py           open/single/corrupted priors
 lassodiff/model_mini.py              core diffusion
+lassodiff/model_mini_v2.py           active residue-level torsion diffusion
+lassodiff/data/mini_grouped_pdb_dataset.py  grouped rank-matched targets
+lassodiff/batch_mini_v2.py            real circular-flow batch builder
+lassodiff/lasso_core_decoder.py       backbone + acceptor-chi decoder
+lassodiff/metrics_mini_v2.py          rollout/RMSD/lDDT metrics
 lassodiff/sidechain_builder.py       Atom14、rotamer/chi
 lassodiff/atom_refiner.py            bounded all-heavy refiner
 lassodiff/candidate_viability.py     coordinate-free viability
@@ -195,7 +244,10 @@ lassodiff/validation/strict_lasso.py strict truth checker
 lassodiff/data/mini_split.py         locked-test cluster 5-fold 合同
 scripts/build_mini_cv_split.py       构建并审计 CV manifest
 scripts/verify_mini_startup.py       训练前门禁
+scripts/verify_mini_v2_startup.py    V2-only behavioral preflight
 scripts/train_mini.py                三段训练
+scripts/train_mini_v2.py             V2 FSDP training route
+scripts/run_mini_v2.py               V2 open-chain/assisted rollout
 scripts/train_mini_cv.py             顺序执行 5 个四卡 folds
 scripts/run_mini.py                  construction/screening
 configs/lassodiff_mini.yaml          默认合同
@@ -205,6 +257,31 @@ tests/mini_v2/                       active torsion/chemistry/strict contract te
 ```
 
 ## Active mini_dev release gates
+
+### V2 full training route
+
+`lassodiff_mini_torsion_v2` 使用真实 grouped-PDB 路由：每个
+`(record_id, sequence, k, p)` 是一个样本，最多三个 rank conformer 保留在
+conformer 维度。批次从 open-chain torsion prior 与目标 conformer 构造
+circular flow，经 frozen ESM/cache conditioner、动态几何 torsion 网络、
+acceptor-chi lasso-core decoder 和多 conformer endpoint loss 完成反向传播。
+推理路径不读取 target/template coordinates。
+
+V2 必须使用独立 preflight；legacy `verify_mini_startup.py` 的 PASS 不能
+授权 V2：
+
+```bash
+python -m scripts.verify_mini_v2_startup \
+  --metadata data/lassopred.data.json \
+  --structure-root structure \
+  --source-split data/lassopred.lmdb/split_topology_hamming_v4.json \
+  --cv-split data/mini_cv5_locked_test_v1.json \
+  --output artifacts/mini_v2/preflight.json
+```
+
+fast gate、真实单候选 overfit gate 和 fold-0 pilot 通过前不得启动五折生产
+训练。最终 rollout 必须回到同一个 `lassodiff.validation.strict_lasso`，并
+分开报告 open-chain unassisted 与 single-crossing assisted 结果。
 
 新版 mini_dev 在任何 full training 或五折 rollout 前必须通过：
 

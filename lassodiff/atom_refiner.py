@@ -110,7 +110,7 @@ class MiniAtomRefinerV2(nn.Module):
         self.layers = int(layers)
         self.max_neighbors = int(max_neighbors)
         self.max_displacement = float(max_displacement)
-        self.blocks = nn.ModuleList(nn.Sequential(nn.Linear(2 * hidden_dim + 1, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, hidden_dim)) for _ in range(layers))
+        self.blocks = nn.ModuleList(nn.Sequential(nn.Linear(3 * hidden_dim + 1, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, hidden_dim)) for _ in range(layers))
 
     def forward(self, coordinates, aa_ids, atom_mask, *, covalent_adjacency=None, bond_type=None):
         if coordinates.ndim != 4 or coordinates.shape[-2:] != (14, 3):
@@ -135,7 +135,9 @@ class MiniAtomRefinerV2(nn.Module):
             rel = x0[:, :, None] - x0[batch, neighbors]
             valid = flat_mask[:, :, None] & flat_mask[batch, neighbors]
             distance = rel.norm(dim=-1, keepdim=True).clamp_max(100)
-            message = block(torch.cat((h[:, :, None].expand_as(h_j), h_j, distance), -1)) * valid[..., None]
+            edge_type = torch.gather(bond_type, 2, neighbors).clamp_min(0).clamp_max(7)
+            edge_embedding = self.bond_embedding(edge_type)
+            message = block(torch.cat((h[:, :, None].expand_as(h_j), h_j, edge_embedding, distance), -1)) * valid[..., None]
             delta = (rel * message.mean(-1, keepdim=True)).sum(2) / valid.sum(2, keepdim=True).clamp_min(1)
             h = (h + message.sum(2) / valid.sum(2, keepdim=True).clamp_min(1)) * flat_mask[..., None]
             x0 = x0 + delta * flat_mask[..., None]

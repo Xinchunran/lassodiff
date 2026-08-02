@@ -24,6 +24,7 @@ def compute_dynamic_pair_geometry(coordinates: torch.Tensor, token_mask: torch.T
     orientation = frames.transpose(-1, -2)[:, :, None] @ frames[:, None, :]
     distance = delta.norm(dim=-1, keepdim=True)
     separation = torch.arange(ca.shape[1], device=ca.device)[None, :, None] - torch.arange(ca.shape[1], device=ca.device)[None, None, :]
+    separation = separation.expand(ca.shape[0], -1, -1)
     valid = token_mask[:, :, None] & token_mask[:, None, :]
     features = torch.cat((distance, local_direction, orientation.reshape(*orientation.shape[:3], 9),
                           separation[..., None].to(ca.dtype) / max(ca.shape[1], 1),

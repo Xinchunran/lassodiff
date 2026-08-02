@@ -23,9 +23,11 @@ class TorsionFlow:
 
 
 def _expand_time(time: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
-    if time.ndim != 1 or time.shape[0] != value.shape[0]:
-        raise ValueError("flow time must have shape [B]")
-    return time.reshape(time.shape[0], *([1] * (value.ndim - 1)))
+    if time.ndim == 1 and time.shape[0] == value.shape[0]:
+        return time.reshape(time.shape[0], *([1] * (value.ndim - 1)))
+    if value.ndim >= 2 and time.ndim == 2 and time.shape[:2] == value.shape[:2]:
+        return time.reshape(*time.shape, *([1] * (value.ndim - 2)))
+    raise ValueError("flow time must have shape [B] or [B,Ns]")
 
 
 def interpolate_torsion_state(source: TorsionState, target: TorsionState, time: torch.Tensor) -> TorsionFlow:

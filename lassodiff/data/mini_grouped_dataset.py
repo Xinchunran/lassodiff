@@ -11,7 +11,16 @@ from torch.utils.data import Dataset
 def grouped_target_mapping_sha256(examples: Iterable[dict[str, Any]]) -> str:
     import hashlib
     import json
-    mapping = [{key: row[key] for key in ("record_id", "sequence", "k", "p")} for row in examples]
+    mapping = []
+    for row in examples:
+        mapping.append({
+            "record_id": row["record_id"], "sequence": row["sequence"],
+            "k": int(row["k"]), "p": int(row["p"]),
+            "conformer_count": int(torch.as_tensor(row["conformer_mask"]).sum())
+            if "conformer_mask" in row else int(row.get("conformer_count", 0)),
+            "ranks": list(row.get("conformer_ranks", ())),
+            "sources": list(row.get("conformer_sources", ())),
+        })
     return hashlib.sha256(json.dumps(mapping, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
@@ -57,6 +66,8 @@ def group_candidate_examples(rows: Iterable[dict[str, Any]], max_conformers: int
         members = sorted(groups[key], key=lambda row: (int(row.get("rank", 0)), str(row.get("target", ""))))[:max_conformers]
         length = len(sequence)
         result: dict[str, Any] = {"record_id": record_id, "sequence": sequence, "k": k, "p": p}
+        result["conformer_ranks"] = tuple(int(x.get("rank", 0)) for x in members)
+        result["conformer_sources"] = tuple(str(x.get("target", "")) for x in members)
         for source, destination, tail, dtype in _TARGET_KEYS:
             shape = (max_conformers, length, *tail)
             result[destination] = torch.zeros(shape, dtype=dtype)
@@ -92,11 +103,19 @@ def collate_grouped_mini(items: list[dict[str, Any] | GroupedMiniExample]) -> di
     for _source, destination, tail, dtype in _TARGET_KEYS:
         result[destination] = torch.zeros((batch_size, max_conformers, max_length, *tail), dtype=dtype)
     result["conformer_mask"] = torch.zeros((batch_size, max_conformers), dtype=torch.bool)
+    result["conformer_ranks"] = [tuple(row.get("conformer_ranks", ())) for row in rows]
+    result["conformer_sources"] = [tuple(row.get("conformer_sources", ())) for row in rows]
+    result["aa_ids"] = torch.full((batch_size, max_length), 20, dtype=torch.long)
     for batch_index, row in enumerate(rows):
         length = len(row["sequence"])
         result["k"][batch_index] = int(row["k"])
         result["p"][batch_index] = int(row["p"])
         result["token_mask"][batch_index, :length] = True
+        if "aa_ids" in row:
+            result["aa_ids"][batch_index, :length] = torch.as_tensor(row["aa_ids"], dtype=torch.long)
+        else:
+            alphabet = "ACDEFGHIKLMNPQRSTVWY"
+            result["aa_ids"][batch_index, :length] = torch.tensor([alphabet.index(aa) for aa in row["sequence"]])
         result["conformer_mask"][batch_index] = row["conformer_mask"]
         for _source, destination, _tail, _dtype in _TARGET_KEYS:
             result[destination][batch_index, :, :length] = row[destination]

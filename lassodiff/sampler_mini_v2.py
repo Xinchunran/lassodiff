@@ -9,6 +9,15 @@ from .torsion_flow import wrap_angle
 from .torsion_state import TorsionState, TorsionVelocity
 
 
+@dataclass
+class MiniV2SampleOutput:
+    state: TorsionState
+    core_coordinates: torch.Tensor
+    atom14_coordinates: torch.Tensor | None
+    atom14_mask: torch.Tensor | None
+    finite: torch.Tensor
+
+
 @dataclass(frozen=True)
 class MiniInferenceConfig:
     prior_mode: str
@@ -26,35 +35,73 @@ class MiniInferenceConfig:
         return cls("single_crossing", False, True, "heun", steps)
 
 
-def open_chain_torsion_prior(candidates: list, *, generator=None, device=None) -> TorsionState:
+def open_chain_torsion_prior(candidates: list, *, num_samples: int = 1, generator=None, device=None) -> TorsionState:
     if not candidates:
         raise ValueError("at least one candidate is required")
     device = torch.device(device or "cpu")
     length = max(len(candidate.sequence) for candidate in candidates)
     batch = len(candidates)
-    backbone = torch.randn((batch, 1, length, 3), generator=generator, device=device) * .8
+    backbone = torch.randn((batch, num_samples, length, 3), generator=generator, device=device) * .8
     backbone[..., 2] = torch.pi
     backbone_mask = torch.zeros_like(backbone, dtype=torch.bool)
-    chi = torch.zeros((batch, 1, length, 4), device=device)
+    chi = torch.zeros((batch, num_samples, length, 4), device=device)
     chi_mask = torch.zeros_like(chi, dtype=torch.bool)
     for index, candidate in enumerate(candidates):
         valid_length = len(candidate.sequence)
-        backbone_mask[index, :, :valid_length] = True
-        chi_mask[index, :, candidate.k] = True
+        backbone_mask[index, :, :valid_length, :] = True
+        backbone_mask[index, :, 0, 0] = False
+        backbone_mask[index, :, valid_length - 1, 1:] = False
+        n_chi = 2 if candidate.sequence[candidate.k] == "D" else 3
+        chi_mask[index, :, candidate.k, :n_chi] = True
     return TorsionState(backbone, backbone_mask, chi, chi_mask)
 
 
 @torch.no_grad()
 def sample_torsion_model(model, conditioner, candidates: list, aa_ids: torch.Tensor, token_mask: torch.Tensor,
-                         *, steps: int = 60, method: str = "heun", generator=None, device=None) -> TorsionState:
+                         *, steps: int = 60, method: str = "heun", generator=None, device=None,
+                         config: MiniInferenceConfig | None = None, num_samples: int = 1) -> MiniV2SampleOutput:
     if any(not isinstance(candidate, type(candidates[0])) for candidate in candidates):
         raise ValueError("candidates must contain CandidateCondition objects")
-    state = open_chain_torsion_prior(candidates, generator=generator, device=device or aa_ids.device)
-    state = state.to(device=aa_ids.device, dtype=aa_ids.dtype if aa_ids.is_floating_point() else torch.float32)
+    config = config or MiniInferenceConfig.unassisted(steps=steps)
+    if config.prior_mode == "open_chain":
+        state = open_chain_torsion_prior(candidates, num_samples=num_samples, generator=generator, device=device or aa_ids.device)
+    elif config.prior_mode == "single_crossing":
+        state = assisted_lasso_torsion_prior(candidates, num_samples=num_samples, generator=generator, device=device or aa_ids.device)
+    else:
+        raise ValueError(f"unknown prior mode {config.prior_mode}")
+    state = state.to(device=aa_ids.device, dtype=torch.float32)
     conditioning = conditioner(sequences=[candidate.sequence for candidate in candidates], aa_ids=aa_ids,
                                 token_mask=token_mask, k=torch.tensor([candidate.k for candidate in candidates], device=aa_ids.device),
                                 p=torch.tensor([candidate.p for candidate in candidates], device=aa_ids.device))
-    return integrate_torsion_flow(model, state, steps, method, {"conditioning": conditioning, "token_mask": token_mask, "candidates": candidates})
+    final = integrate_torsion_flow(model, state, config.steps, config.method,
+                                   {"conditioning": conditioning, "token_mask": token_mask, "candidates": candidates})
+    from .lasso_core_decoder import decode_lasso_core
+    from .chi_geometry import build_atom14_from_rigid_groups
+    core = decode_lasso_core(final, sequences=[x.sequence for x in candidates], candidates=candidates, token_mask=token_mask)
+    finite = torch.isfinite(core).all(dim=(-1, -2, -3))
+    atom14 = core.new_zeros((len(candidates), final.backbone.shape[1], core.shape[2], 14, 3))
+    atom14_mask = torch.zeros(atom14.shape[:-1], dtype=torch.bool, device=core.device)
+    for b, candidate in enumerate(candidates):
+        aa = aa_ids[b, :len(candidate.sequence)]
+        for sample in range(final.backbone.shape[1]):
+            coords, mask = build_atom14_from_rigid_groups(
+                core[b, sample, :len(candidate.sequence)], aa,
+                final.acceptor_chi[b, sample, :len(candidate.sequence)],
+                final.acceptor_chi_mask[b, sample, :len(candidate.sequence)], candidate,
+            )
+            atom14[b, sample, :len(candidate.sequence)] = coords
+            atom14_mask[b, sample, :len(candidate.sequence)] = mask
+    finite = finite & torch.isfinite(atom14).all(dim=(-1, -2, -3))
+    return MiniV2SampleOutput(final, core, atom14, atom14_mask, finite)
+
+
+def assisted_lasso_torsion_prior(candidates: list, *, num_samples: int = 1, generator=None, device=None) -> TorsionState:
+    """Explicit secondary prior; never used by the unassisted path."""
+    state = open_chain_torsion_prior(candidates, num_samples=num_samples, generator=generator, device=device)
+    for b, candidate in enumerate(candidates):
+        state.backbone[b, :, :, 1] = 0.0
+        state.backbone[b, :, :candidate.k + 1, 0] = 0.5
+    return state
 
 
 def integrate_torsion_flow(model, initial_state: TorsionState, steps: int, method: str = "euler", model_kwargs: dict | None = None) -> TorsionState:
@@ -64,7 +111,7 @@ def integrate_torsion_flow(model, initial_state: TorsionState, steps: int, metho
     state = initial_state.clone()
     dt = 1.0 / (steps - 1)
     for index in range(steps - 1):
-        time = torch.full((state.backbone.shape[0],), index * dt, dtype=state.backbone.dtype, device=state.backbone.device)
+        time = torch.full(state.backbone.shape[:2], index * dt, dtype=state.backbone.dtype, device=state.backbone.device)
         velocity = model(state_t=state, time=time, **model_kwargs)
         if isinstance(velocity, TorsionVelocity):
             first = velocity

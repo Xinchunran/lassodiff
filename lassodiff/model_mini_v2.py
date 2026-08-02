@@ -1,4 +1,4 @@
-"""Residue-level torsion diffusion model for mini_dev."""
+"""Residue-level, sequence-conditioned torsion diffusion for Mini V2."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -7,18 +7,20 @@ import math
 import torch
 import torch.nn as nn
 
-from .backbone_kinematics import build_core_from_torsions
 from .conditioning_mini_v2 import MiniConditioning
 from .dynamic_geometry_mini import compute_dynamic_pair_geometry
+from .lasso_core_decoder import decode_lasso_core
 from .torsion_state import TorsionState, TorsionVelocity
+from .torsion_flow import wrap_angle
 
 
 def _time_features(time: torch.Tensor, dim: int) -> torch.Tensor:
-    half = dim // 2
+    flat = time.reshape(-1)
+    half = max(dim // 2, 1)
     freq = torch.exp(torch.linspace(0, math.log(1000), half, device=time.device, dtype=time.dtype))
-    value = time[:, None] * freq[None] * (2 * math.pi)
+    value = flat[:, None] * freq[None] * (2 * math.pi)
     out = torch.cat((torch.sin(value), torch.cos(value)), -1)
-    return out if out.shape[-1] == dim else torch.cat((out, time[:, None]), -1)
+    return out[:, :dim] if out.shape[-1] >= dim else torch.cat((out, flat[:, None]), -1)[:, :dim]
 
 
 @dataclass
@@ -30,55 +32,73 @@ class MiniTorsionOutput:
 class _Block(nn.Module):
     def __init__(self, single_dim: int, pair_dim: int, hidden_dim: int):
         super().__init__()
-        self.pair = nn.Linear(pair_dim, single_dim)
+        self.pair_to_single = nn.Linear(pair_dim, single_dim)
+        self.geometry_to_pair = nn.Linear(16, pair_dim)
         self.update = nn.Sequential(nn.LayerNorm(single_dim), nn.Linear(single_dim, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, single_dim))
+        self.backbone_delta = nn.Linear(single_dim, 3)
+        self.chi_delta = nn.Linear(single_dim, 4)
 
-    def forward(self, single, pair, mask):
-        aggregate = self.pair(pair).masked_fill(~mask[..., None], 0).sum(2) / mask.sum(2, keepdim=True).clamp_min(1)
+    def forward(self, single, pair, geometry, mask):
+        pair_value = pair + self.geometry_to_pair(geometry)
+        aggregate = self.pair_to_single(pair_value).masked_fill(~mask[..., None], 0).sum(2)
+        aggregate = aggregate / mask.sum(2, keepdim=True).clamp_min(1)
         node_mask = mask.any(dim=2)
-        return (single + self.update(single + aggregate)) * node_mask[..., None]
+        single = (single + self.update(single + aggregate)) * node_mask[..., None]
+        return single, self.backbone_delta(single), self.chi_delta(single)
 
 
 class MiniTorsionDiffusion(nn.Module):
     architecture_id = "lassodiff_mini_torsion_v2"
     schema_version = 2
 
-    def __init__(self, single_dim: int = 256, pair_dim: int = 128, blocks: int = 8,
-                 hidden_dim: int = 256, heads: int = 8, dropout: float = .05):
+    def __init__(self, single_dim=256, pair_dim=128, blocks=8, hidden_dim=256, heads=8, dropout=.05):
         super().__init__()
         self.single_dim, self.pair_dim = single_dim, pair_dim
         self.blocks = nn.ModuleList(_Block(single_dim, pair_dim, hidden_dim) for _ in range(blocks))
         self.time_projection = nn.Linear(single_dim, single_dim)
-        self.geometry_projection = nn.Linear(16, single_dim)
+        self.state_projection = nn.Linear(14, single_dim)
         self.backbone_head = nn.Sequential(nn.LayerNorm(single_dim), nn.Linear(single_dim, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, 3))
         self.chi_head = nn.Sequential(nn.LayerNorm(single_dim), nn.Linear(single_dim, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, 4))
+        self.geometry_step_scale = 0.05
 
     def forward(self, *, state_t: TorsionState, time: torch.Tensor, conditioning: MiniConditioning,
                 token_mask: torch.Tensor, candidates: list):
         if state_t.backbone.ndim != 4:
             raise ValueError("state_t.backbone must be [B,Ns,L,3]")
         B, Ns, L, _ = state_t.backbone.shape
-        single = conditioning.single
-        if single.shape[:2] != (B, L):
-            raise ValueError("conditioning and torsion state shapes differ")
-        pair = conditioning.pair
-        # Dynamic geometry is deliberately recomputed inside every block.
-        dynamic_calls = 0
-        torsions = state_t.backbone[:, 0]
-        coords = torch.stack([build_core_from_torsions(candidates[b].sequence,
-                                                        torsions[b, :len(candidates[b].sequence), 0],
-                                                        torsions[b, :len(candidates[b].sequence), 1],
-                                                        torsions[b, :len(candidates[b].sequence), 2]) for b in range(B)])
-        for block in self.blocks:
-            geometry = compute_dynamic_pair_geometry(coords, token_mask)
-            dynamic_calls += 1
-            # Use invariant scalar geometry channels in the residue update.
-            geom_pair = geometry[..., :pair.shape[-1]] if geometry.shape[-1] >= pair.shape[-1] else torch.nn.functional.pad(geometry, (0, pair.shape[-1] - geometry.shape[-1]))
-            single = block(single + self.geometry_projection(geometry.mean(2)), pair + geom_pair, conditioning.pair_mask)
-        time_feature = self.time_projection(_time_features(time.to(single.dtype), self.single_dim))[:, None]
-        single = single + time_feature
-        velocity = TorsionVelocity(
-            self.backbone_head(single)[:, None].expand(B, Ns, L, 3) * state_t.backbone_mask,
-            self.chi_head(single)[:, None].expand(B, Ns, L, 4) * state_t.acceptor_chi_mask,
+        if conditioning.single.shape[:2] != (B, L) or time.shape not in {(B,), (B, Ns)}:
+            raise ValueError("conditioning/state/time shapes disagree")
+        flat = B * Ns
+        flat_state = TorsionState(
+            state_t.backbone.reshape(flat, 1, L, 3), state_t.backbone_mask.reshape(flat, 1, L, 3),
+            state_t.acceptor_chi.reshape(flat, 1, L, 4), state_t.acceptor_chi_mask.reshape(flat, 1, L, 4),
         )
-        return MiniTorsionOutput(velocity, dynamic_calls)
+        single = conditioning.single[:, None].expand(B, Ns, L, -1).reshape(flat, L, -1)
+        pair = conditioning.pair[:, None].expand(B, Ns, L, L, -1).reshape(flat, L, L, -1)
+        pair_mask = conditioning.pair_mask[:, None].expand(B, Ns, L, L).reshape(flat, L, L)
+        flat_mask = token_mask[:, None].expand(B, Ns, L).reshape(flat, L)
+        flat_candidates = [candidate for candidate in candidates for _ in range(Ns)]
+        flat_sequences = [candidate.sequence for candidate in flat_candidates]
+        state_features = torch.cat((torch.sin(flat_state.backbone[:, 0]), torch.cos(flat_state.backbone[:, 0]),
+                                    torch.sin(flat_state.acceptor_chi[:, 0]), torch.cos(flat_state.acceptor_chi[:, 0])), dim=-1)
+        single = single + self.state_projection(state_features)
+        tf = time if time.ndim == 2 else time[:, None].expand(B, Ns)
+        single = single + self.time_projection(_time_features(tf.reshape(-1), self.single_dim)).reshape(flat, 1, -1)
+        running_backbone = flat_state.backbone[:, 0]
+        running_chi = flat_state.acceptor_chi[:, 0]
+        calls = 0
+        for block in self.blocks:
+            running_state = TorsionState(running_backbone[:, None], flat_state.backbone_mask,
+                                         running_chi[:, None], flat_state.acceptor_chi_mask)
+            coordinates = decode_lasso_core(running_state, sequences=flat_sequences,
+                                            candidates=flat_candidates, token_mask=flat_mask)[:, 0]
+            geometry = compute_dynamic_pair_geometry(coordinates, flat_mask)
+            single, delta_backbone, delta_chi = block(single, pair, geometry, pair_mask)
+            running_backbone = wrap_angle(running_backbone + self.geometry_step_scale * delta_backbone) * flat_state.backbone_mask[:, 0]
+            running_chi = wrap_angle(running_chi + self.geometry_step_scale * delta_chi) * flat_state.acceptor_chi_mask[:, 0]
+            calls += 1
+        velocity = TorsionVelocity(
+            self.backbone_head(single).reshape(B, Ns, L, 3) * state_t.backbone_mask,
+            self.chi_head(single).reshape(B, Ns, L, 4) * state_t.acceptor_chi_mask,
+        )
+        return MiniTorsionOutput(velocity, calls)

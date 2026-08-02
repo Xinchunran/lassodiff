@@ -128,6 +128,44 @@ def build_atom14_from_rigid_groups(backbone_core: torch.Tensor, aa_ids: torch.Te
     return (result[0][0], result[1][0]) if squeeze else result
 
 
+def build_acceptor_reactive_atoms(*, sequence: str, core: torch.Tensor,
+                                  acceptor_index: int, chi: torch.Tensor,
+                                  chi_mask: torch.Tensor, n_terminal_position=None):
+    """Build the formed acceptor carbon and oxygen from acceptor chi.
+
+    This is deliberately a residue-specific internal-coordinate route.  It
+    does not use the legacy radial sidechain fallback, so a predicted chi
+    change necessarily changes the reactive atoms used by the lasso decoder.
+    """
+    aa = sequence[acceptor_index]
+    if aa not in {"D", "E"}:
+        raise ValueError("formed acceptor must be Asp or Glu")
+    if core.ndim != 3 or core.shape[1:] != (7, 3):
+        raise ValueError("core must be [L,7,3]")
+    if chi.shape[-1] != 4 or chi_mask.shape[-1] != 4:
+        raise ValueError("acceptor chi must have four padded slots")
+    residue = core[acceptor_index]
+    n, ca, cb = residue[ATOM_N], residue[ATOM_CA], residue[ATOM_CB]
+    def angle(index):
+        return chi[index] if bool(chi_mask[index]) else chi.new_tensor(0.0)
+    cg = _place(n, ca, cb, 1.522, math.radians(109.5), math.pi - angle(0))
+    if aa == "D":
+        ciso = _place(ca, cb, cg, 1.522, math.radians(109.5), math.pi - angle(1))
+        predecessor = cg
+    else:
+        cd = _place(ca, cb, cg, 1.522, math.radians(109.5), math.pi - angle(1))
+        ciso = cd
+        predecessor = cg
+        # chi3 controls the formed carbonyl oxygen's approach around the
+        # CG-CD-OE1 bond; this is the GLU-specific predecessor path.
+        _ = angle(2)
+    # ciso is the third internal-coordinate atom, so the returned point is
+    # exactly one carbonyl bond length from the formed carbon.
+    oiso = _place(ca, predecessor, ciso, 1.24, math.radians(120.8),
+                  math.pi - (angle(2) if aa == "E" else chi.new_tensor(0.0)))
+    return ciso, oiso
+
+
 def extract_chi_angles(atom14_coordinates: torch.Tensor, atom14_mask: torch.Tensor, aa_ids: torch.Tensor, candidates) -> ChiTargets:
     if atom14_coordinates.ndim != 5:
         raise ValueError("chi extraction expects [B,M,L,14,3]")
