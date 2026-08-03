@@ -21,10 +21,11 @@ class ChiTargets:
 def _place(a, b, c, length, angle, dihedral):
     bc = c - b; bc = bc / bc.norm().clamp_min(1e-8)
     normal = torch.linalg.cross(b - a, bc, dim=-1)
-    fallback = torch.tensor([0., 0., 1.], dtype=c.dtype, device=c.device)
-    if float(normal.norm()) < 1e-7:
-        fallback = torch.tensor([0., 1., 0.], dtype=c.dtype, device=c.device)
-        normal = torch.linalg.cross(fallback, bc, dim=-1)
+    z_axis = torch.tensor([0., 0., 1.], dtype=c.dtype, device=c.device)
+    y_axis = torch.tensor([0., 1., 0.], dtype=c.dtype, device=c.device)
+    fallback = torch.where(bc[..., 2:3].abs() > .9, y_axis, z_axis)
+    fallback_normal = torch.linalg.cross(fallback, bc, dim=-1)
+    normal = torch.where(normal.norm(dim=-1, keepdim=True) < 1e-7, fallback_normal, normal)
     normal = normal / normal.norm().clamp_min(1e-8)
     in_plane = torch.linalg.cross(normal, bc, dim=-1)
     return c + length * (-math.cos(angle) * bc + math.sin(angle) * (torch.cos(dihedral) * in_plane + torch.sin(dihedral) * normal))
@@ -102,35 +103,40 @@ def build_atom14_from_rigid_groups(backbone_core: torch.Tensor, aa_ids: torch.Te
         mask = torch.tensor([[bool(name) for name in row] for row in names], dtype=torch.bool, device=backbone_core.device)
         rows = torch.stack([_build_one(backbone_core[batch, residue], aa, residue, names[residue], chi_angles[batch, residue], chi_masks[batch, residue])
                             for residue, aa in enumerate(sequence)])
+        reactive_cg, _reactive_ciso, _reactive_oiso = _build_acceptor_reactive_group(
+            sequence=sequence,
+            core=backbone_core[batch],
+            acceptor_index=candidate.k,
+            chi=chi_angles[batch, candidate.k],
+            chi_mask=chi_masks[batch, candidate.k],
+        )
         if sequence[candidate.k] == "D":
             lookup = {name: slot for slot, name in enumerate(names[candidate.k]) if name}
             ciso = backbone_core[batch, candidate.k, 5]
-            if float(ciso.norm()) < 1e-6:
-                direction = backbone_core[batch, candidate.k, ATOM_CB] - backbone_core[batch, candidate.k, ATOM_CA]
-                ciso = backbone_core[batch, candidate.k, ATOM_CB] + 1.52 * direction / direction.norm().clamp_min(1e-8)
-            direction_o = backbone_core[batch, candidate.k, ATOM_CA] - ciso
-            oiso = ciso + 1.24 * direction_o / direction_o.norm().clamp_min(1e-8)
+            oiso = backbone_core[batch, candidate.k, 6]
+            use_reactive = ciso.norm() < 1e-6
+            ciso = torch.where(use_reactive, _reactive_ciso, ciso)
+            oiso = torch.where(use_reactive, _reactive_oiso, oiso)
             rows[candidate.k, lookup["CG"]] = ciso
             rows[candidate.k, lookup["OD1"]] = oiso
         elif sequence[candidate.k] == "E":
             lookup = {name: slot for slot, name in enumerate(names[candidate.k]) if name}
             ciso = backbone_core[batch, candidate.k, 5]
-            if float(ciso.norm()) < 1e-6:
-                direction = backbone_core[batch, candidate.k, ATOM_CB] - backbone_core[batch, candidate.k, ATOM_CA]
-                ciso = backbone_core[batch, candidate.k, ATOM_CB] + 1.52 * direction / direction.norm().clamp_min(1e-8)
-            direction_o = backbone_core[batch, candidate.k, ATOM_CA] - ciso
-            oiso = ciso + 1.24 * direction_o / direction_o.norm().clamp_min(1e-8)
+            oiso = backbone_core[batch, candidate.k, 6]
+            use_reactive = ciso.norm() < 1e-6
+            ciso = torch.where(use_reactive, _reactive_ciso, ciso)
+            oiso = torch.where(use_reactive, _reactive_oiso, oiso)
             rows[candidate.k, lookup["CD"]] = ciso
             rows[candidate.k, lookup["OE1"]] = oiso
-            rows[candidate.k, lookup["CG"]] = (rows[candidate.k, lookup["CB"]] + rows[candidate.k, lookup["CD"]]) / 2
+            rows[candidate.k, lookup["CG"]] = reactive_cg
         outputs.append(rows); masks.append(mask)
     result = torch.stack(outputs), torch.stack(masks)
     return (result[0][0], result[1][0]) if squeeze else result
 
 
-def build_acceptor_reactive_atoms(*, sequence: str, core: torch.Tensor,
-                                  acceptor_index: int, chi: torch.Tensor,
-                                  chi_mask: torch.Tensor, n_terminal_position=None):
+def _build_acceptor_reactive_group(*, sequence: str, core: torch.Tensor,
+                                   acceptor_index: int, chi: torch.Tensor,
+                                   chi_mask: torch.Tensor):
     """Build the formed acceptor carbon and oxygen from acceptor chi.
 
     This is deliberately a residue-specific internal-coordinate route.  It
@@ -148,21 +154,28 @@ def build_acceptor_reactive_atoms(*, sequence: str, core: torch.Tensor,
     n, ca, cb = residue[ATOM_N], residue[ATOM_CA], residue[ATOM_CB]
     def angle(index):
         return chi[index] if bool(chi_mask[index]) else chi.new_tensor(0.0)
-    cg = _place(n, ca, cb, 1.522, math.radians(109.5), math.pi - angle(0))
+    cg = _place(n, ca, cb, 1.520, math.radians(109.5), math.pi - angle(0))
     if aa == "D":
-        ciso = _place(ca, cb, cg, 1.522, math.radians(109.5), math.pi - angle(1))
-        predecessor = cg
+        ciso = cg
+        oiso = _place(ca, cb, ciso, 1.24, math.radians(120.8), math.pi - angle(1))
     else:
-        cd = _place(ca, cb, cg, 1.522, math.radians(109.5), math.pi - angle(1))
+        cd = _place(ca, cb, cg, 1.520, math.radians(109.5), math.pi - angle(1))
         ciso = cd
-        predecessor = cg
-        # chi3 controls the formed carbonyl oxygen's approach around the
-        # CG-CD-OE1 bond; this is the GLU-specific predecessor path.
-        _ = angle(2)
-    # ciso is the third internal-coordinate atom, so the returned point is
-    # exactly one carbonyl bond length from the formed carbon.
-    oiso = _place(ca, predecessor, ciso, 1.24, math.radians(120.8),
-                  math.pi - (angle(2) if aa == "E" else chi.new_tensor(0.0)))
+        oiso = _place(cb, cg, ciso, 1.24, math.radians(120.8), math.pi - angle(2))
+    return cg, ciso, oiso
+
+
+def build_acceptor_reactive_atoms(*, sequence: str, core: torch.Tensor,
+                                  acceptor_index: int, chi: torch.Tensor,
+                                  chi_mask: torch.Tensor, n_terminal_position=None):
+    """Return CISO/OISO from the residue-specific formed acceptor group."""
+    _cg, ciso, oiso = _build_acceptor_reactive_group(
+        sequence=sequence,
+        core=core,
+        acceptor_index=acceptor_index,
+        chi=chi,
+        chi_mask=chi_mask,
+    )
     return ciso, oiso
 
 

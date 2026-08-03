@@ -26,6 +26,18 @@ class ProcessedLassoStructure:
     source: str
 
 
+def canonicalize_to_root_frame(coords: torch.Tensor, n0: torch.Tensor,
+                               ca0: torch.Tensor, c0: torch.Tensor) -> torch.Tensor:
+    """Rigidly map coordinates into the decoder's canonical root frame."""
+    ex = torch.nn.functional.normalize(ca0 - n0, dim=-1)
+    c_direction = c0 - n0
+    ey = c_direction - (c_direction * ex).sum(dim=-1, keepdim=True) * ex
+    ey = torch.nn.functional.normalize(ey, dim=-1)
+    ez = torch.linalg.cross(ex, ey, dim=-1)
+    rotation = torch.stack((ex, ey, ez), dim=-1)
+    return (coords - n0) @ rotation
+
+
 def _sequence_letter(resname: str, *, is_acceptor: bool) -> str:
     if is_acceptor and resname == "ASX":
         return "D"

@@ -59,7 +59,8 @@ def open_chain_torsion_prior(candidates: list, *, num_samples: int = 1, generato
 @torch.no_grad()
 def sample_torsion_model(model, conditioner, candidates: list, aa_ids: torch.Tensor, token_mask: torch.Tensor,
                          *, steps: int = 60, method: str = "heun", generator=None, device=None,
-                         config: MiniInferenceConfig | None = None, num_samples: int = 1) -> MiniV2SampleOutput:
+                         config: MiniInferenceConfig | None = None, num_samples: int = 1,
+                         sidechain_head=None, refiner=None) -> MiniV2SampleOutput:
     if any(not isinstance(candidate, type(candidates[0])) for candidate in candidates):
         raise ValueError("candidates must contain CandidateCondition objects")
     config = config or MiniInferenceConfig.unassisted(steps=steps)
@@ -77,20 +78,43 @@ def sample_torsion_model(model, conditioner, candidates: list, aa_ids: torch.Ten
                                    {"conditioning": conditioning, "token_mask": token_mask, "candidates": candidates})
     from .lasso_core_decoder import decode_lasso_core
     from .chi_geometry import build_atom14_from_rigid_groups
+    from .residue_constants_mini import CHI_ATOMS
     core = decode_lasso_core(final, sequences=[x.sequence for x in candidates], candidates=candidates, token_mask=token_mask)
     finite = torch.isfinite(core).all(dim=(-1, -2, -3))
     atom14 = core.new_zeros((len(candidates), final.backbone.shape[1], core.shape[2], 14, 3))
     atom14_mask = torch.zeros(atom14.shape[:-1], dtype=torch.bool, device=core.device)
+    if sidechain_head is not None:
+        predicted_chi = sidechain_head(conditioning.single)
+    else:
+        predicted_chi = core.new_zeros((len(candidates), core.shape[2], 4))
     for b, candidate in enumerate(candidates):
         aa = aa_ids[b, :len(candidate.sequence)]
+        chi_mask = torch.zeros((len(candidate.sequence), 4), dtype=torch.bool, device=core.device)
+        for residue, amino_acid in enumerate(candidate.sequence):
+            chi_mask[residue, :len(CHI_ATOMS.get(amino_acid, ()))] = True
         for sample in range(final.backbone.shape[1]):
+            chi = predicted_chi[b, :len(candidate.sequence)].clone()
+            chi[candidate.k] = final.acceptor_chi[b, sample, candidate.k]
+            chi_mask[candidate.k] = final.acceptor_chi_mask[b, sample, candidate.k]
             coords, mask = build_atom14_from_rigid_groups(
                 core[b, sample, :len(candidate.sequence)], aa,
-                final.acceptor_chi[b, sample, :len(candidate.sequence)],
-                final.acceptor_chi_mask[b, sample, :len(candidate.sequence)], candidate,
+                chi, chi_mask, candidate,
             )
             atom14[b, sample, :len(candidate.sequence)] = coords
             atom14_mask[b, sample, :len(candidate.sequence)] = mask
+    if refiner is not None:
+        from .covalent_graph import build_atom14_covalent_graph
+        B, Ns, L = atom14.shape[:3]
+        graph = build_atom14_covalent_graph(aa_ids, token_mask, candidates)
+        flat_coordinates = atom14.reshape(B * Ns, L, 14, 3)
+        flat_mask = atom14_mask.reshape(B * Ns, L, 14)
+        flat_aa = aa_ids[:, None].expand(B, Ns, L).reshape(B * Ns, L)
+        adjacency = graph.adjacency[:, None].expand(B, Ns, L * 14, L * 14).reshape(B * Ns, L * 14, L * 14)
+        bond_type = graph.bond_type[:, None].expand(B, Ns, L * 14, L * 14).reshape(B * Ns, L * 14, L * 14)
+        atom14 = refiner(
+            flat_coordinates, flat_aa, flat_mask,
+            covalent_adjacency=adjacency, bond_type=bond_type,
+        ).reshape(B, Ns, L, 14, 3)
     finite = finite & torch.isfinite(atom14).all(dim=(-1, -2, -3))
     return MiniV2SampleOutput(final, core, atom14, atom14_mask, finite)
 
@@ -117,7 +141,11 @@ def integrate_torsion_flow(model, initial_state: TorsionState, steps: int, metho
             first = velocity
         else:
             first = velocity.velocity
-        if method == "heun":
+        # At t=1 different random-source paths share an endpoint but need not
+        # share a velocity.  Querying the model there makes the final Heun
+        # correction ill-posed.  Use the last identifiable t<1 velocity for
+        # the endpoint step (equivalent to the reference Euler denoise).
+        if method == "heun" and index < steps - 2:
             midpoint = TorsionState(wrap_angle(state.backbone + dt * first.backbone) * state.backbone_mask, state.backbone_mask,
                                     wrap_angle(state.acceptor_chi + dt * first.acceptor_chi) * state.acceptor_chi_mask, state.acceptor_chi_mask)
             second_raw = model(state_t=midpoint, time=torch.full_like(time, (index + 1) * dt), **model_kwargs)

@@ -19,7 +19,8 @@ def _require_v2_preflight(path, cv_split, source_split):
     report = json.loads(Path(path).read_text(encoding="utf-8"))
     expected = {"status": "PASS", "architecture_id": "lassodiff_mini_torsion_v2", "schema_version": 2,
                 "distributed_backend": "fsdp_full_shard", "template_coordinates_used": False,
-                "unassisted_prior": "open_chain", "fake_overfit_path_present": False}
+                "unassisted_prior": "open_chain", "fake_overfit_path_present": False,
+                "decoder_fit_route": True}
     for key, value in expected.items():
         if report.get(key) != value:
             raise RuntimeError(f"V2 preflight mismatch: {key}")
@@ -33,6 +34,7 @@ def _require_v2_preflight(path, cv_split, source_split):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--metadata", required=True); parser.add_argument("--structure-root", required=True)
+    parser.add_argument("--target-fit-cache", required=True)
     parser.add_argument("--source-split", required=True); parser.add_argument("--cv-split", required=True)
     parser.add_argument("--esm-cache", default=None); parser.add_argument("--output", required=True)
     args = parser.parse_args()
@@ -40,7 +42,10 @@ def main():
     validate_mini_cv_manifest(cv, source)
     # Dataset construction is part of preflight; an empty or rank-unqualified
     # dataset fails instead of authorizing a merely importable trainer.
-    dataset = GroupedMiniPDBDataset(args.metadata, args.structure_root, record_ids=cv["folds"][0]["train"])
+    dataset = GroupedMiniPDBDataset(
+        args.metadata, args.structure_root, record_ids=cv["folds"][0]["train"],
+        decoder_fit_cache=args.target_fit_cache, require_decoder_fit=True,
+    )
     candidate = CandidateCondition("AAADRAAA", 3, 5)
     L = len(candidate.sequence)
     phi, psi, omega = torch.zeros(L), torch.zeros(L), torch.full((L,), torch.pi)
@@ -66,6 +71,7 @@ def main():
               "distributed_backend": "fsdp_full_shard", "template_coordinates_used": False,
               "unassisted_prior": "open_chain", "fake_overfit_path_present": False,
               "real_forward_backward": True, "sampler_decoder_route": True,
+              "decoder_fit_route": True,
               "esm_route": "cached_or_live_frozen", "dataset_mapping_sha256": dataset.mapping_sha256,
               "cv_split_manifest_sha256": cv["manifest_sha256"], "source_split_manifest_sha256": source["manifest_sha256"]}
     out = Path(args.output); out.parent.mkdir(parents=True, exist_ok=True); out.write_text(json.dumps(report, indent=2) + "\n")

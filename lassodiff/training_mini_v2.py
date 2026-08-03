@@ -10,14 +10,17 @@ from .batch_mini_v2 import prepare_backbone_flow_batch
 from .conditioning_mini_v2 import MiniSequenceConditioner
 from .lasso_core_decoder import decode_lasso_core
 from .losses_mini_v2 import (MiniV2LossOutput, circular_velocity_loss,
-                             conformer_softmin_core_loss, core_clash_surrogate,
+                             circular_angle_loss, conformer_softmin_core_loss, core_clash_surrogate,
                              iso_geometry_loss, scheduled_weight)
 from .model_mini_v2 import MiniTorsionDiffusion
-from .sampler_mini_v2 import sample_torsion_model
+from .sampler_mini_v2 import integrate_torsion_flow, sample_torsion_model
 from .torsion_flow import estimate_torsion_endpoint
 from .chi_geometry import build_atom14_from_rigid_groups
 from .covalent_graph import build_atom14_covalent_graph
 from .seq_encoder import seq_to_aa_ids
+from .residue_constants_mini import CHI_ATOMS
+from .topology_adapter import CandidateBatch
+from .validation.threading_mini import soft_topology_surrogate_ca
 
 
 class _TinyFrozenEncoder(nn.Module):
@@ -65,7 +68,13 @@ class MiniTrainingSystemV2(nn.Module):
 
     @classmethod
     def tiny_for_test(cls, residue_encoder=None):
-        return cls(residue_encoder=residue_encoder or _TinyFrozenEncoder(), single_dim=32, pair_dim=16, hidden_dim=32, blocks=2)
+        return cls(
+            residue_encoder=residue_encoder or _TinyFrozenEncoder(),
+            single_dim=32,
+            pair_dim=16,
+            hidden_dim=32,
+            blocks=2,
+        )
 
     def configure_stage(self, stage: str):
         if stage not in {"backbone", "sidechain", "refiner", "joint"}:
@@ -106,44 +115,123 @@ class MiniTrainingSystemV2(nn.Module):
         # Endpoint torsion supervision stabilizes the first gate while the
         # coordinate endpoint learns the canonical-frame geometry.  It is an
         # auxiliary target, not a replacement for the multi-conformer loss.
-        endpoint_core = endpoint_core + .5 * circular_velocity_loss(
+        endpoint_core = endpoint_core + .5 * circular_angle_loss(
             endpoint_state.backbone, prepared.target_state.backbone, prepared.target_state.backbone_mask
-        ) + .5 * circular_velocity_loss(
+        ) + .5 * circular_angle_loss(
             endpoint_state.acceptor_chi, prepared.target_state.acceptor_chi, prepared.target_state.acceptor_chi_mask
         )
-        iso = iso_geometry_loss(endpoint, prepared.candidates, prepared.token_mask)
-        topology_weight = scheduled_weight(global_step, start_step=1000, ramp_steps=2000, final_weight=.25)
+        isolated_flow_gate = bool(raw_batch.get("fixed_flow", False))
+        rollout_interval = 10 if isolated_flow_gate else 100
+        rollout_start = 100 if isolated_flow_gate else 500
+        use_rollout_loss = global_step >= rollout_start and global_step % rollout_interval == 0
+        if use_rollout_loss:
+            rollout_steps = 10 if isolated_flow_gate else 4
+            rollout_state = integrate_torsion_flow(
+                self.backbone,
+                prepared.source_state,
+                steps=rollout_steps,
+                method="euler",
+                model_kwargs={
+                    "conditioning": conditioning,
+                    "token_mask": prepared.token_mask,
+                    "candidates": prepared.candidates,
+                },
+            )
+            rollout_core = decode_lasso_core(
+                rollout_state,
+                sequences=prepared.sequences,
+                candidates=prepared.candidates,
+                token_mask=prepared.token_mask,
+            )
+            rollout_endpoint = conformer_softmin_core_loss(
+                rollout_core,
+                prepared.core_targets,
+                prepared.core_target_masks,
+                prepared.conformer_mask,
+            )
+            rollout_endpoint = rollout_endpoint + .5 * circular_angle_loss(
+                rollout_state.backbone,
+                prepared.target_state.backbone,
+                prepared.target_state.backbone_mask,
+            ) + .5 * circular_angle_loss(
+                rollout_state.acceptor_chi,
+                prepared.target_state.acceptor_chi,
+                prepared.target_state.acceptor_chi_mask,
+            )
+            endpoint_core = endpoint_core + rollout_endpoint
+        iso = iso_geometry_loss(
+            endpoint, prepared.candidates, prepared.token_mask,
+            endpoint_state.acceptor_chi, endpoint_state.acceptor_chi_mask,
+        )
+        # Establish the shortest-path tangent field before exposing it to the
+        # much larger nonlinear coordinate loss.  Without this warm-up the
+        # decoder endpoint can be matched with extra angular windings while the
+        # sampler follows the wrong ODE trajectory.
+        endpoint_weight = scheduled_weight(
+            global_step,
+            start_step=100 if isolated_flow_gate else 500,
+            ramp_steps=300 if isolated_flow_gate else 1000,
+            final_weight=1.0,
+        )
+        topology_weight = (
+            0.0 if isolated_flow_gate else
+            scheduled_weight(global_step, start_step=1000, ramp_steps=2000, final_weight=.25)
+        )
         topology = endpoint.new_zeros(()) if topology_weight == 0 else self._topology_surrogate(endpoint, prepared)
         clash = core_clash_surrogate(endpoint, prepared.candidates, prepared.token_mask)
         sidechain = endpoint.new_zeros(())
         if self.current_stage in {"sidechain", "joint"}:
             predicted_chi = self.sidechain(conditioning.single)
-            selected_chi = prepared.target_state.acceptor_chi[:, 0]
-            selected_mask = prepared.target_state.acceptor_chi_mask[:, 0]
-            sidechain = circular_velocity_loss(predicted_chi, selected_chi, selected_mask)
-        iso_weight = .25 + scheduled_weight(global_step, start_step=0, ramp_steps=1000, final_weight=1.75)
-        total = backbone_flow + chi_flow + endpoint_core + iso_weight * iso + topology_weight * topology + .02 * clash + sidechain
-        if self.current_stage == "refiner":
+            batch_index = torch.arange(len(prepared.candidates), device=endpoint.device)
+            selected_chi = prepared.all_chi_targets[batch_index, prepared.target_conformer_index]
+            selected_mask = prepared.all_chi_masks[batch_index, prepared.target_conformer_index]
+            sidechain = circular_angle_loss(predicted_chi, selected_chi, selected_mask)
+        iso_weight = (
+            0.0 if isolated_flow_gate else
+            .25 + scheduled_weight(global_step, start_step=0, ramp_steps=1000, final_weight=1.75)
+        )
+        clash_weight = 0.0 if isolated_flow_gate else .02
+        total = (
+            backbone_flow + chi_flow + endpoint_weight * endpoint_core + iso_weight * iso
+            + topology_weight * topology + clash_weight * clash + sidechain
+        )
+        if self.current_stage in {"refiner", "joint"}:
             # Refiner stage uses predicted endpoint coordinates and a mandatory
             # covalent graph; its coordinate loss is kept separate in reports.
             aa_ids = prepared.aa_ids
+            refiner_chi = self.sidechain(conditioning.single)
             atom14_rows, atom14_masks = [], []
             for b, candidate in enumerate(prepared.candidates):
                 aa = aa_ids[b, :len(candidate.sequence)]
-                coords, atom_mask = build_atom14_from_rigid_groups(
-                    endpoint_state.backbone[b, 0, :len(candidate.sequence)].new_zeros((len(candidate.sequence), 7, 3))
-                    + endpoint[b, 0, :len(candidate.sequence)], aa,
-                    endpoint_state.acceptor_chi[b, 0, :len(candidate.sequence)],
-                    endpoint_state.acceptor_chi_mask[b, 0, :len(candidate.sequence)], candidate,
-                )
-                atom14_rows.append(coords); atom14_masks.append(atom_mask)
+                general_mask = torch.zeros((len(candidate.sequence), 4), dtype=torch.bool, device=endpoint.device)
+                for residue, amino_acid in enumerate(candidate.sequence):
+                    general_mask[residue, :len(CHI_ATOMS.get(amino_acid, ()))] = True
+                for sample in range(endpoint.shape[1]):
+                    chi = refiner_chi[b, :len(candidate.sequence)].clone()
+                    chi[candidate.k] = endpoint_state.acceptor_chi[b, sample, candidate.k]
+                    chi_mask = general_mask.clone()
+                    chi_mask[candidate.k] = endpoint_state.acceptor_chi_mask[b, sample, candidate.k]
+                    coords, atom_mask = build_atom14_from_rigid_groups(
+                        endpoint[b, sample, :len(candidate.sequence)], aa,
+                        chi, chi_mask, candidate,
+                    )
+                    atom14_rows.append(coords); atom14_masks.append(atom_mask)
             max_len = aa_ids.shape[1]
             atom14 = endpoint.new_zeros((len(atom14_rows), max_len, 14, 3)); atom_mask = torch.zeros((len(atom14_rows), max_len, 14), dtype=torch.bool, device=endpoint.device)
             for b, (coords, mask) in enumerate(zip(atom14_rows, atom14_masks)):
                 atom14[b, :coords.shape[0]] = coords; atom_mask[b, :mask.shape[0]] = mask
             graph = build_atom14_covalent_graph(aa_ids, prepared.token_mask, prepared.candidates)
-            refined = self.refiner(atom14, aa_ids, atom_mask, covalent_adjacency=graph.adjacency, bond_type=graph.bond_type)
-            refine = (refined - atom14).square().mean()
+            graph_adjacency = graph.adjacency[:, None].expand(len(prepared.candidates), endpoint.shape[1], -1, -1).reshape(atom14.shape[0], atom14.shape[1] * 14, atom14.shape[1] * 14)
+            graph_bond_type = graph.bond_type[:, None].expand(len(prepared.candidates), endpoint.shape[1], -1, -1).reshape(atom14.shape[0], atom14.shape[1] * 14, atom14.shape[1] * 14)
+            flat_aa = aa_ids[:, None].expand(-1, endpoint.shape[1], -1).reshape(atom14.shape[0], -1)
+            refined = self.refiner(atom14, flat_aa, atom_mask, covalent_adjacency=graph_adjacency, bond_type=graph_bond_type)
+            target_index = prepared.target_conformer_index
+            selected_target = prepared.atom14_targets[torch.arange(len(prepared.candidates), device=endpoint.device), target_index]
+            selected_target = selected_target[:, None].expand(-1, endpoint.shape[1], -1, -1, -1).reshape_as(atom14)
+            selected_mask = prepared.atom14_target_masks[torch.arange(len(prepared.candidates), device=endpoint.device), target_index]
+            selected_mask = selected_mask[:, None].expand(-1, endpoint.shape[1], -1, -1).reshape_as(atom_mask)
+            refine = ((refined - selected_target).square() * selected_mask[..., None]).sum() / selected_mask.sum().clamp_min(1)
+            refine = refine + .01 * (refined - atom14).square().mean()
             total = total + refine
         else:
             refine = endpoint.new_zeros(())
@@ -151,13 +239,29 @@ class MiniTrainingSystemV2(nn.Module):
                                 topology, clash, sidechain, refine, endpoint.new_zeros(()))
 
     @staticmethod
-    def _topology_surrogate(endpoint, prepared):
-        # Smooth ring closure surrogate only; strict topology remains an
-        # evaluation-only authority.
+    def _iso_closure_surrogate(endpoint, prepared):
         values = []
         for b, candidate in enumerate(prepared.candidates):
-            values.append((endpoint[b, :, 0, 0] - endpoint[b, :, candidate.k, 5]).norm(dim=-1).square().mean())
+            distance = (endpoint[b, :, 0, 0] - endpoint[b, :, candidate.k, 5]).norm(dim=-1)
+            values.append((distance - 1.33).square().mean())
         return torch.stack(values).mean()
+
+    @staticmethod
+    def _topology_surrogate(endpoint, prepared):
+        B, Ns, L = endpoint.shape[:3]
+        k = prepared.k[:, None].expand(B, Ns)
+        p = prepared.p[:, None].expand(B, Ns)
+        candidates = CandidateBatch(
+            k, p, k, torch.ones_like(k, dtype=endpoint.dtype),
+            torch.ones_like(k, dtype=torch.bool),
+        )
+        ca_mask = prepared.token_mask[:, None].expand(B, Ns, L)
+        result = soft_topology_surrogate_ca(
+            endpoint[:, :, :, 1], prepared.token_mask, candidates, ca_mask,
+        )
+        if not bool(result.valid.any()):
+            return endpoint.new_zeros(())
+        return -torch.log(result.probability_exactly_one[result.valid].clamp_min(1e-6)).mean()
 
     def rollout_for_test(self, raw_batch, *, samples=1, steps=40, seed=23):
         from .data.mini_grouped_dataset import collate_grouped_mini
@@ -191,8 +295,12 @@ class MiniTrainingSystemV2(nn.Module):
         target = batch["core_targets"][0][batch["conformer_mask"][0]].to(core.device)
         generated_ca = core[:, :, 1, :]
         target_ca = target[:, :, 1, :]
-        rmsd = torch.sqrt(((generated_ca[:, None] - target_ca[None]) ** 2).sum(-1).mean(-1)).min().item()
-        lddt = 1.0 / (1.0 + rmsd)
+        distances = torch.sqrt(((generated_ca[:, None] - target_ca[None]) ** 2).sum(-1).mean(-1))
+        rmsd = distances.min().item()
+        from .metrics_mini_v2 import lddt_score
+        lddt = max(float(lddt_score(generated_ca[index], target_ca[target_index]))
+                   for index in range(generated_ca.shape[0])
+                   for target_index in range(target_ca.shape[0]))
         lengths = (core[:, :-1, 2] - core[:, 1:, 0]).norm(dim=-1)
         bond_valid = ((lengths - 1.329).abs() < 2e-3).float().mean().item()
         from .validation.strict_lasso import strict_lasso_check

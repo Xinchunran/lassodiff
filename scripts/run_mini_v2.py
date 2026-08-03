@@ -21,18 +21,25 @@ def main():
     parser.add_argument("--mode", choices=("unassisted", "assisted"), default="unassisted"); parser.add_argument("--output", required=True)
     args = parser.parse_args()
     candidate = CandidateCondition(args.sequence, args.k, args.p)
-    system = MiniTrainingSystemV2(); load_mini_v2_checkpoint(args.checkpoint, system=system)
+    system = MiniTrainingSystemV2(); checkpoint = load_mini_v2_checkpoint(args.checkpoint, system=system)
+    if checkpoint.get("stage") not in {"refiner", "joint"}:
+        raise RuntimeError("full-heavy-atom rollout requires a refiner or joint checkpoint")
     system.eval(); device = next(system.parameters()).device
     aa = torch.tensor([["ACDEFGHIKLMNPQRSTVWY".index(a) for a in candidate.sequence]], dtype=torch.long, device=device)
     mask = torch.ones((1, len(candidate.sequence)), dtype=torch.bool, device=device)
     config = MiniInferenceConfig.unassisted(args.steps) if args.mode == "unassisted" else MiniInferenceConfig.assisted(args.steps)
     output = sample_torsion_model(system.backbone, system.conditioner, [candidate], aa, mask,
                                   config=config, steps=args.steps, num_samples=args.samples,
-                                  generator=torch.Generator().manual_seed(17), device=device)
+                                  generator=torch.Generator().manual_seed(17), device=device,
+                                  sidechain_head=system.sidechain, refiner=system.refiner)
     rows = []
-    for sample, finite in zip(output.core_coordinates[0], output.finite[0]):
+    for sample_index, (sample, finite) in enumerate(zip(output.core_coordinates[0], output.finite[0])):
         sample_mask = candidate.core_atom_mask.to(sample.device)
-        rows.append(evaluate_generated_candidate(sample, sample_mask, candidate))
+        rows.append(evaluate_generated_candidate(
+            sample, sample_mask, candidate,
+            atom14_coordinates=output.atom14_coordinates[0, sample_index],
+            atom14_atom_mask=output.atom14_mask[0, sample_index],
+        ))
     report = {"architecture_id": system.architecture_id, "schema_version": 2, "prior_mode": config.prior_mode,
               "projection_used": config.projection, "topology_seeded": config.topology_seeded,
               "samples": rows, "finite_rate": float(output.finite.float().mean())}

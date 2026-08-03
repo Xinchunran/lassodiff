@@ -27,7 +27,9 @@ class MiniSequenceConditioner(nn.Module):
         self.single_dim = single_dim
         self.pair_dim = pair_dim
         self.aa_embedding = nn.Embedding(21, 64)
-        self.single_projection = nn.Sequential(nn.Linear(residue_encoder_dim + 64 + 8, single_dim), nn.SiLU(), nn.Linear(single_dim, single_dim))
+        self.esm_projection = nn.Linear(residue_encoder_dim, single_dim)
+        self.esm_gate_logit = nn.Parameter(torch.tensor(-4.0))
+        self.single_projection = nn.Sequential(nn.Linear(single_dim + 64 + 8, single_dim), nn.SiLU(), nn.Linear(single_dim, single_dim))
         self.pair_projection = nn.Sequential(nn.Linear(7, pair_dim), nn.SiLU(), nn.Linear(pair_dim, pair_dim))
 
     def train(self, mode: bool = True):
@@ -47,6 +49,7 @@ class MiniSequenceConditioner(nn.Module):
                              (index > pp).to(esm.dtype), (index == kk).to(esm.dtype),
                              (index == pp).to(esm.dtype), (index == 0).to(esm.dtype),
                              (index - kk).abs() / max(L, 1), (index - pp).abs() / max(L, 1)), -1)
+        esm = torch.sigmoid(self.esm_gate_logit) * self.esm_projection(esm)
         single = self.single_projection(torch.cat((esm, self.aa_embedding(aa_ids), roles), -1))
         rel = index[:, :, None] - index[:, None, :]
         pair_static = torch.stack((rel / max(L, 1), rel.abs() / max(L, 1),

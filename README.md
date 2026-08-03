@@ -291,3 +291,31 @@ python -m pytest tests/mini_v2 -q
 ```
 
 slow gate、locked validation 和最终 Lasso 评价都必须调用同一个 `strict_lasso_check`。teacher-forced loss、坐标有限性、backbone bond validity、single-crossing seed 成功率和 checkpoint keys 都不能单独构成 release 证据。
+
+### V2 remediation audit
+
+`patch.md` records the current correctness remediation and measured gate status.
+Production training now requires an offline, content-addressed decoder-fit cache.
+Raw strict-invalid PDB targets and missing/non-converged fit entries are rejected.
+Build a focused cache and produce real per-rank metrics with:
+
+```bash
+python -m scripts.cache_mini_v2_targets \
+  --metadata data/lassopred.data.json \
+  --structure-root Protenix/fine-tuning/structure \
+  --record-ids LP_14506 \
+  --output artifacts/mini_v2/target_fit_lp14506
+
+python scripts/measure_mini_v2_remediation.py \
+  --metadata data/lassopred.data.json \
+  --structure-root Protenix/fine-tuning/structure \
+  --record-id LP_14506 \
+  --target-fit-cache artifacts/mini_v2/target_fit_lp14506 \
+  --output artifacts/mini_v2/remediation_metrics_fitted.json
+```
+
+The JSON/JSONL report separates decoder-fit-to-raw accuracy, core strict validity,
+and final full-Atom14 strict validity. The top-level status remains `FAIL` unless
+the full-heavy-atom output passes the unchanged strict checker. As of the current
+commit, fast tests pass, but the slow rollout gate and full-Atom14 clash gate fail;
+therefore fold training remains prohibited.

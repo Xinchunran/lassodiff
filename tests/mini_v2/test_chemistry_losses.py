@@ -2,8 +2,11 @@ import torch
 from lassodiff.losses_mini_v2 import all_atom_clash_loss,circular_velocity_loss
 
 
-def test_circular_velocity_loss_respects_periodicity():
-    assert float(circular_velocity_loss(torch.tensor([torch.pi-.01]),torch.tensor([-torch.pi+.01]),torch.tensor([True])))<1e-3
+def test_velocity_loss_penalizes_extra_winding():
+    base = circular_velocity_loss(torch.tensor([0.3]), torch.tensor([0.3]), torch.tensor([True]))
+    winding = circular_velocity_loss(torch.tensor([0.3 + 2 * torch.pi]), torch.tensor([0.3]), torch.tensor([True]))
+    assert float(base) == 0.0
+    assert float(winding) > 1.0
 
 
 def test_clash_loss_excludes_bonded_pairs():

@@ -11,6 +11,7 @@ from lassodiff.data.mini_grouped_dataset import collate_grouped_mini
 from lassodiff.data.mini_grouped_pdb_dataset import GroupedMiniPDBDataset
 from lassodiff.training_mini_v2 import MiniTrainingSystemV2
 from lassodiff.esm_encoder_mini import CachedESMResidueEncoder
+from lassodiff.target_fit_mini_v2 import load_decoder_fit_manifest
 from scripts.verify_mini_v2_startup import _require_v2_preflight
 
 
@@ -43,6 +44,7 @@ def _source_commit():
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--metadata", required=True); parser.add_argument("--structure-root", required=True)
+    parser.add_argument("--target-fit-cache", required=True)
     parser.add_argument("--esm-cache", default=None)
     parser.add_argument("--preflight", required=True); parser.add_argument("--split", required=True)
     parser.add_argument("--source-split", required=True); parser.add_argument("--config", default="configs/lassodiff_mini_v2.yaml")
@@ -58,9 +60,15 @@ def main():
     rank, world, device = _dist()
     cv, source = json.loads(Path(args.split).read_text()), json.loads(Path(args.source_split).read_text())
     preflight = _require_v2_preflight(args.preflight, cv, source)
+    fit_manifest = load_decoder_fit_manifest(args.target_fit_cache)
+    fit_manifest_sha256 = fit_manifest.get("manifest_sha256")
+    if not isinstance(fit_manifest_sha256, str) or len(fit_manifest_sha256) != 64:
+        raise RuntimeError("decoder-fit cache manifest is missing its SHA256")
     selected = _fold(cv, args.fold)
-    train = GroupedMiniPDBDataset(args.metadata, args.structure_root, record_ids=selected["train"])
-    valid = GroupedMiniPDBDataset(args.metadata, args.structure_root, record_ids=selected["val"])
+    train = GroupedMiniPDBDataset(args.metadata, args.structure_root, record_ids=selected["train"],
+                                  decoder_fit_cache=args.target_fit_cache, require_decoder_fit=True)
+    valid = GroupedMiniPDBDataset(args.metadata, args.structure_root, record_ids=selected["val"],
+                                  decoder_fit_cache=args.target_fit_cache, require_decoder_fit=True)
     if Path(args.run_dir).exists() and any(Path(args.run_dir).iterdir()) and args.resume is None:
         raise RuntimeError("refusing to write into a non-empty V2 run directory")
     Path(args.run_dir).mkdir(parents=True, exist_ok=True)
@@ -81,7 +89,8 @@ def main():
     if args.resume:
         checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
         validate_resume_checkpoint(checkpoint, stage=args.stage, cv_split_manifest_sha256=cv["manifest_sha256"],
-                                   source_split_manifest_sha256=source["manifest_sha256"], dataset_mapping_sha256=train.mapping_sha256)
+                                   source_split_manifest_sha256=source["manifest_sha256"], dataset_mapping_sha256=train.mapping_sha256,
+                                   decoder_fit_manifest_sha256=fit_manifest_sha256)
         load_mini_v2_checkpoint(args.resume, system=system)
         optimizer.load_state_dict(checkpoint["optimizer"]); start = int(checkpoint["step"])
     steps = args.steps or {"backbone": 10000, "sidechain": 4000, "refiner": 3000, "joint": 3000}[args.stage]
@@ -112,6 +121,7 @@ def main():
                 if rank == 0:
                     provenance = {"source_commit": _source_commit(), "encoder_name": "esm2_t30_150M_UR50D", "encoder_revision": "main", "encoder_frozen": True,
                                   "grouped_target_mapping_sha256": train.mapping_sha256, "dataset_mapping_sha256": train.mapping_sha256,
+                                  "decoder_fit_manifest_sha256": fit_manifest_sha256,
                                   "validation_mapping_sha256": valid.mapping_sha256, "cv_split_manifest_sha256": cv["manifest_sha256"], "source_split_manifest_sha256": source["manifest_sha256"]}
                     save_mini_v2_checkpoint(Path(args.run_dir) / ("checkpoint-final.pt" if step == steps else f"checkpoint-{step}.pt"),
                                             system=system, optimizer=optimizer, step=step, stage=args.stage, world_size=world, preflight=preflight, provenance=provenance)

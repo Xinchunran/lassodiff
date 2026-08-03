@@ -29,7 +29,9 @@ def load_mini_v2_checkpoint(path, system=None, *, encoder_name=None, encoder_rev
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     if checkpoint.get("architecture_id") != ARCHITECTURE_ID or checkpoint.get("schema_version") != SCHEMA_VERSION:
         raise RuntimeError("checkpoint is not a lassodiff_mini_torsion_v2 checkpoint")
-    required = ("source_commit", "stage", "encoder_name", "encoder_revision", "encoder_frozen", "grouped_target_mapping_sha256", "cv_split_manifest_sha256", "source_split_manifest_sha256")
+    required = ("source_commit", "stage", "encoder_name", "encoder_revision", "encoder_frozen",
+                "grouped_target_mapping_sha256", "decoder_fit_manifest_sha256",
+                "cv_split_manifest_sha256", "source_split_manifest_sha256")
     missing = [key for key in required if key not in checkpoint]
     if missing:
         raise RuntimeError(f"V2 checkpoint is missing provenance fields: {missing}")
@@ -51,7 +53,8 @@ def load_mini_v2_checkpoint(path, system=None, *, encoder_name=None, encoder_rev
 def validate_resume_checkpoint(checkpoint, *, stage, cv_split_manifest_sha256=None,
                                source_split_manifest_sha256=None, dataset_mapping_sha256=None,
                                encoder_name=None, encoder_revision=None,
-                               esm_cache_manifest_sha256=None):
+                               esm_cache_manifest_sha256=None,
+                               decoder_fit_manifest_sha256=None):
     if checkpoint.get("architecture_id") != ARCHITECTURE_ID or checkpoint.get("schema_version") != SCHEMA_VERSION:
         raise RuntimeError("resume checkpoint is not V2")
     if checkpoint.get("stage") != stage:
@@ -61,7 +64,8 @@ def validate_resume_checkpoint(checkpoint, *, stage, cv_split_manifest_sha256=No
                           ("source_split_manifest_sha256", source_split_manifest_sha256),
                           ("dataset_mapping_sha256", dataset_mapping_sha256),
                           ("encoder_name", encoder_name), ("encoder_revision", encoder_revision),
-                          ("esm_cache_manifest_sha256", esm_cache_manifest_sha256)):
+                          ("esm_cache_manifest_sha256", esm_cache_manifest_sha256),
+                          ("decoder_fit_manifest_sha256", decoder_fit_manifest_sha256)):
         if expected is not None and provenance.get(key) != expected:
             raise RuntimeError(f"resume provenance mismatch: {key}")
     if "optimizer" not in checkpoint:

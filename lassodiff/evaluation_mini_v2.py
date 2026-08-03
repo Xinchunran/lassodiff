@@ -6,20 +6,25 @@ REQUIRED_SYSTEMS = REQUIRED_BASELINE_KEYS
 REQUIRED_SAMPLE_FIELDS = frozenset({"finite", "strict_valid", "backbone_valid", "formed_geometry", "crossing_count", "plug_match", "tail_persistence", "clash_valid", "ca_rmsd_best_target", "lddt_best_target"})
 
 
-def evaluate_rollout_samples(core_samples, target_core, target_mask, candidate):
+def evaluate_rollout_samples(core_samples, target_core, target_mask, candidate,
+                             atom14_samples=None, atom14_masks=None):
     """Evaluate every generated sample through the strict checker."""
     import torch
-    from .metrics_mini_v2 import best_ca_rmsd, lddt_score
+    from .metrics_mini_v2 import lddt_score
     rows = []
     valid_targets = target_core[target_mask.any(dim=(-1, -2))] if target_mask.ndim == 3 else target_core
-    best = best_ca_rmsd(core_samples, valid_targets)
-    for sample in core_samples:
+    for sample_index, sample in enumerate(core_samples):
         ca = sample[:, 1, :]
         target_ca = valid_targets[:, :, 1, :]
+        rmsd = min(float(torch.sqrt((ca - target).square().sum(-1).mean())) for target in target_ca)
         lddt = max(float(lddt_score(ca, t)) for t in target_ca) if len(target_ca) else 0.0
         mask = torch.ones(sample.shape[:-1], dtype=torch.bool, device=sample.device)
-        rows.append(evaluate_generated_candidate(sample, mask, candidate,
-                                                  ca_rmsd_best_target=float(best), lddt_best_target=lddt))
+        rows.append(evaluate_generated_candidate(
+            sample, mask, candidate,
+            atom14_coordinates=None if atom14_samples is None else atom14_samples[sample_index],
+            atom14_atom_mask=None if atom14_masks is None else atom14_masks[sample_index],
+            ca_rmsd_best_target=rmsd, lddt_best_target=lddt,
+        ))
     return rows
 
 

@@ -16,10 +16,12 @@ def grouped_target_mapping_sha256(examples: Iterable[dict[str, Any]]) -> str:
         mapping.append({
             "record_id": row["record_id"], "sequence": row["sequence"],
             "k": int(row["k"]), "p": int(row["p"]),
+            "loop_size": int(row.get("loop_size", int(row["k"]) + 1)),
             "conformer_count": int(torch.as_tensor(row["conformer_mask"]).sum())
             if "conformer_mask" in row else int(row.get("conformer_count", 0)),
             "ranks": list(row.get("conformer_ranks", ())),
             "sources": list(row.get("conformer_sources", ())),
+            "decoder_fit_cache_keys": list(row.get("decoder_fit_cache_keys", ())),
         })
     return hashlib.sha256(json.dumps(mapping, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
@@ -65,9 +67,17 @@ def group_candidate_examples(rows: Iterable[dict[str, Any]], max_conformers: int
         record_id, sequence, k, p = key
         members = sorted(groups[key], key=lambda row: (int(row.get("rank", 0)), str(row.get("target", ""))))[:max_conformers]
         length = len(sequence)
-        result: dict[str, Any] = {"record_id": record_id, "sequence": sequence, "k": k, "p": p}
+        result: dict[str, Any] = {"record_id": record_id, "sequence": sequence, "k": k, "p": p,
+                                  "loop_size": int(members[0].get("loop_size", k + 1))}
         result["conformer_ranks"] = tuple(int(x.get("rank", 0)) for x in members)
         result["conformer_sources"] = tuple(str(x.get("target", "")) for x in members)
+        result["canonical_roots"] = tuple(x.get("canonical_root") for x in members)
+        result["decoder_fit_cache_keys"] = tuple(str(x.get("decoder_fit_cache_key", "")) for x in members)
+        result["decoder_fit_metrics"] = tuple({
+            "ca_rmsd": x.get("decoder_fit_ca_rmsd"),
+            "lddt": x.get("decoder_fit_lddt"),
+            "raw_target_strict_valid": x.get("raw_target_strict_valid"),
+        } for x in members)
         for source, destination, tail, dtype in _TARGET_KEYS:
             shape = (max_conformers, length, *tail)
             result[destination] = torch.zeros(shape, dtype=dtype)
@@ -99,17 +109,22 @@ def collate_grouped_mini(items: list[dict[str, Any] | GroupedMiniExample]) -> di
         "k": torch.zeros((batch_size,), dtype=torch.long),
         "p": torch.zeros((batch_size,), dtype=torch.long),
         "token_mask": torch.zeros((batch_size, max_length), dtype=torch.bool),
+        "loop_size": torch.zeros((batch_size,), dtype=torch.long),
     }
     for _source, destination, tail, dtype in _TARGET_KEYS:
         result[destination] = torch.zeros((batch_size, max_conformers, max_length, *tail), dtype=dtype)
     result["conformer_mask"] = torch.zeros((batch_size, max_conformers), dtype=torch.bool)
     result["conformer_ranks"] = [tuple(row.get("conformer_ranks", ())) for row in rows]
     result["conformer_sources"] = [tuple(row.get("conformer_sources", ())) for row in rows]
+    result["canonical_roots"] = [tuple(row.get("canonical_roots", ())) for row in rows]
+    result["decoder_fit_cache_keys"] = [tuple(row.get("decoder_fit_cache_keys", ())) for row in rows]
+    result["decoder_fit_metrics"] = [tuple(row.get("decoder_fit_metrics", ())) for row in rows]
     result["aa_ids"] = torch.full((batch_size, max_length), 20, dtype=torch.long)
     for batch_index, row in enumerate(rows):
         length = len(row["sequence"])
         result["k"][batch_index] = int(row["k"])
         result["p"][batch_index] = int(row["p"])
+        result["loop_size"][batch_index] = int(row.get("loop_size", int(row["k"]) + 1))
         result["token_mask"][batch_index, :length] = True
         if "aa_ids" in row:
             result["aa_ids"][batch_index, :length] = torch.as_tensor(row["aa_ids"], dtype=torch.long)

@@ -77,7 +77,11 @@ def prepare_backbone_flow_batch(batch: dict, *, device: torch.device,
                                 target_state.acceptor_chi * source_mask_c, source_mask_c)
     if batch.get("fixed_flow", False) and global_step is not None:
         phase = (int(global_step) - 1) % 10 / 9.0
-        time = torch.full((B, num_samples), min_time + phase * (max_time - min_time), device=device)
+        time = torch.full(
+            (B, num_samples),
+            min_time + phase * (max_time - min_time),
+            device=device,
+        )
     else:
         time = torch.rand((B, num_samples), generator=generator, device=device) * (max_time - min_time) + min_time
     flow = interpolate_torsion_state(source_state, target_state, time)
