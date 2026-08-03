@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 from .atom_schema_lasso import ATOM_CB, ATOM_CISO, ATOM_N, ATOM_OISO
 from .chi_geometry import _build_acceptor_reactive_group
+from .residue_constants_mini import SYMMETRIC_ATOM_PAIRS, padded_atom14_names
 
 
 def circular_velocity_loss(predicted: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -68,6 +69,44 @@ def conformer_softmin_core_loss(predicted_core, target_core, target_mask, confor
     logits = (-per / tau).masked_fill(~valid, float("-inf"))
     count = valid.sum(dim=-1).clamp_min(1).to(logits.dtype)
     return (-tau * (torch.logsumexp(logits, dim=-1) - count.log())).mean()
+
+
+def atom14_local_loss(predicted, target, target_mask):
+    """Masked Atom14 coordinate loss in the canonical decoder frame."""
+    if predicted.shape != target.shape or target_mask.shape != predicted.shape[:-1]:
+        raise ValueError("Atom14 local-loss shapes do not match")
+    error = (predicted - target).square().sum(dim=-1)
+    weight = target_mask.to(error.dtype)
+    return (error * weight).sum() / weight.sum().clamp_min(1.0)
+
+
+def symmetry_aware_atom14_loss(predicted, target, target_mask, sequences,
+                               *, acceptor_indices=None):
+    """Atom14 loss minimized over chemically equivalent target swaps."""
+    if predicted.ndim != 4:
+        raise ValueError("predicted Atom14 must be [B,L,14,3]")
+    total = predicted.new_zeros(())
+    for b, sequence in enumerate(sequences):
+        names = padded_atom14_names(sequence, None)
+        best = predicted.new_full((len(sequence),), float("inf"))
+        for residue, aa in enumerate(sequence):
+            candidates = [target[b, residue]]
+            for left, right in SYMMETRIC_ATOM_PAIRS.get(aa, ()):
+                swapped = target[b, residue].clone()
+                lookup = {name: slot for slot, name in enumerate(names[residue]) if name}
+                if left in lookup and right in lookup:
+                    swapped[[lookup[left], lookup[right]]] = swapped[[lookup[right], lookup[left]]]
+                candidates.append(swapped)
+            values = []
+            for candidate_target in candidates:
+                values.append(atom14_local_loss(
+                    predicted[b, residue:residue + 1],
+                    candidate_target[None],
+                    target_mask[b, residue:residue + 1],
+                ))
+            best[residue] = torch.stack(values).min()
+        total = total + best.mean()
+    return total / max(len(sequences), 1)
 
 
 def scheduled_weight(step: int, *, start_step: int, ramp_steps: int, final_weight: float) -> float:

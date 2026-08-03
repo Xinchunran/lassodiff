@@ -10,7 +10,10 @@ from pathlib import Path
 import torch
 
 from .atom_schema_lasso import ATOM_CB, ATOM_CISO, ATOM_N, ATOM_OISO, CandidateCondition
+from .covalent_graph import build_atom14_covalent_graph
 from .chi_geometry import _build_acceptor_reactive_group, build_atom14_from_rigid_groups
+from .losses_mini_v2 import atom14_local_loss, all_atom_clash_loss, symmetry_aware_atom14_loss
+from .residue_constants_mini import ELEMENTS, padded_atom14_names
 from .lasso_core_decoder import decode_lasso_core
 from .metrics_mini_v2 import lddt_score
 from .torsion_flow import shortest_angular_difference, wrap_angle
@@ -18,7 +21,7 @@ from .torsion_state import TorsionState
 from .validation.strict_lasso import strict_lasso_check
 
 
-DECODER_FIT_VERSION = "mini_decoder_fit_v1"
+DECODER_FIT_VERSION = "mini_decoder_fit_v2_af2_rigid_groups"
 
 
 def load_decoder_fit_manifest(cache_root: str | Path) -> dict:
@@ -52,6 +55,7 @@ class DecoderFitResult:
     atom14_mask: torch.Tensor
     canonical_ca_rmsd: float
     lddt: float
+    core_strict_valid: bool
     strict_valid: bool
     strict_rejection_reasons: tuple[str, ...]
     steps: int
@@ -156,6 +160,9 @@ def fit_decoder_consistent_target(
         decoded = decode_lasso_core(
             state, sequences=[sequence], candidates=[candidate], token_mask=token_mask,
         )[0, 0]
+        decoded_atom14, decoded_atom14_mask = build_atom14_from_rigid_groups(
+            decoded, aa_ids, fitted_chi, chi_mask, candidate,
+        )
         valid = core_mask[..., None].to(decoded.dtype)
         coordinate = ((decoded - canonical_core).square() * valid).sum() / valid.sum().clamp_min(1)
         ca = (decoded[:, 1] - canonical_core[:, 1]).square().sum(-1).mean()
@@ -168,7 +175,26 @@ def fit_decoder_consistent_target(
         regularizer = (regularizer * backbone_mask).sum() / backbone_mask.sum().clamp_min(1)
         chi_regularizer = shortest_angular_difference(fitted_chi, initial_chi).square()
         chi_regularizer = (chi_regularizer * chi_mask).sum() / chi_mask.sum().clamp_min(1)
-        loss = ca + 5.0 * reactive + geometry + .0001 * (regularizer + chi_regularizer)
+        atom_local = atom14_local_loss(decoded_atom14, atom14_target, atom14_mask)
+        atom_symmetry = symmetry_aware_atom14_loss(
+            decoded_atom14[None], atom14_target[None], atom14_mask[None], [sequence],
+        )
+        graph = build_atom14_covalent_graph(
+            aa_ids[None], torch.ones((1, length), dtype=torch.bool, device=aa_ids.device), [candidate],
+        )
+        names = padded_atom14_names(sequence, candidate.k)
+        elements = [[ELEMENTS.get(name, "C") for residue in names for name in residue]]
+        full_clash = all_atom_clash_loss(
+            decoded_atom14.reshape(1, length * 14, 3),
+            decoded_atom14_mask.reshape(1, length * 14),
+            elements,
+            bonded_12=graph.bonded_12,
+            bonded_13=graph.bonded_13,
+            bonded_14=graph.bonded_14,
+        )
+        loss = (ca + 5.0 * reactive + geometry
+                + 0.25 * atom_local + 0.25 * atom_symmetry + 0.02 * full_clash
+                + .0001 * (regularizer + chi_regularizer))
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
@@ -195,13 +221,17 @@ def fit_decoder_consistent_target(
     decoded_atom14, decoded_atom14_mask = build_atom14_from_rigid_groups(
         decoded, aa_ids, fitted_chi_value, chi_mask, candidate,
     )
-    strict = strict_lasso_check(decoded, candidate.core_atom_mask.to(decoded.device), candidate)
+    core_strict = strict_lasso_check(decoded, candidate.core_atom_mask.to(decoded.device), candidate)
+    full_strict = strict_lasso_check(
+        decoded, candidate.core_atom_mask.to(decoded.device), candidate,
+        atom14_coordinates=decoded_atom14, atom14_atom_mask=decoded_atom14_mask,
+    )
     ca_rmsd = torch.sqrt((decoded[:, 1] - canonical_core[:, 1]).square().sum(-1).mean())
     score = lddt_score(decoded[:, 1], canonical_core[:, 1])
-    converged = bool(strict.valid and ca_rmsd < .75 and score > .95)
+    converged = bool(core_strict.valid and full_strict.valid and ca_rmsd < .75 and score > .95)
     return DecoderFitResult(
         fitted_backbone_value, backbone_mask.detach().clone(), fitted_chi_value,
         chi_mask.detach().clone(), decoded.detach(), decoded_atom14.detach(),
-        decoded_atom14_mask.detach(), float(ca_rmsd), float(score), bool(strict.valid),
-        tuple(strict.rejection_reasons), used_steps, converged,
+        decoded_atom14_mask.detach(), float(ca_rmsd), float(score), bool(core_strict.valid),
+        bool(full_strict.valid), tuple(full_strict.rejection_reasons), used_steps, converged,
     )

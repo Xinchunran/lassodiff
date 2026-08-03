@@ -82,6 +82,10 @@ def group_candidate_examples(rows: Iterable[dict[str, Any]], max_conformers: int
             shape = (max_conformers, length, *tail)
             result[destination] = torch.zeros(shape, dtype=dtype)
         result["conformer_mask"] = torch.zeros((max_conformers,), dtype=torch.bool)
+        has_raw_atom14 = all("raw_atom14" in member and "raw_atom14_mask" in member for member in members)
+        if has_raw_atom14:
+            result["raw_atom14_targets"] = torch.zeros((max_conformers, length, 14, 3), dtype=torch.float32)
+            result["raw_atom14_target_masks"] = torch.zeros((max_conformers, length, 14), dtype=torch.bool)
         for index, member in enumerate(members):
             result["conformer_mask"][index] = True
             for source, destination, _tail, _dtype in _TARGET_KEYS:
@@ -92,6 +96,9 @@ def group_candidate_examples(rows: Iterable[dict[str, Any]], max_conformers: int
                 if value.shape != expected:
                     raise ValueError(f"target {source} has shape {tuple(value.shape)}, expected {tuple(expected)}")
                 result[destination][index] = value.to(dtype=result[destination].dtype)
+            if has_raw_atom14:
+                result["raw_atom14_targets"][index] = torch.as_tensor(member["raw_atom14"], dtype=torch.float32)
+                result["raw_atom14_target_masks"][index] = torch.as_tensor(member["raw_atom14_mask"], dtype=torch.bool)
         output.append(result)
     return output
 
@@ -120,6 +127,9 @@ def collate_grouped_mini(items: list[dict[str, Any] | GroupedMiniExample]) -> di
     result["decoder_fit_cache_keys"] = [tuple(row.get("decoder_fit_cache_keys", ())) for row in rows]
     result["decoder_fit_metrics"] = [tuple(row.get("decoder_fit_metrics", ())) for row in rows]
     result["aa_ids"] = torch.full((batch_size, max_length), 20, dtype=torch.long)
+    if all("raw_atom14_targets" in row for row in rows):
+        result["raw_atom14_targets"] = torch.zeros((batch_size, max_conformers, max_length, 14, 3), dtype=torch.float32)
+        result["raw_atom14_target_masks"] = torch.zeros((batch_size, max_conformers, max_length, 14), dtype=torch.bool)
     for batch_index, row in enumerate(rows):
         length = len(row["sequence"])
         result["k"][batch_index] = int(row["k"])
@@ -134,6 +144,9 @@ def collate_grouped_mini(items: list[dict[str, Any] | GroupedMiniExample]) -> di
         result["conformer_mask"][batch_index] = row["conformer_mask"]
         for _source, destination, _tail, _dtype in _TARGET_KEYS:
             result[destination][batch_index, :, :length] = row[destination]
+        if "raw_atom14_targets" in result:
+            result["raw_atom14_targets"][batch_index, :, :length] = row["raw_atom14_targets"]
+            result["raw_atom14_target_masks"][batch_index, :, :length] = row["raw_atom14_target_masks"]
     return result
 
 

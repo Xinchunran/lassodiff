@@ -17,7 +17,7 @@ state:
   acceptor_chi: true
   canonical_root_frame: true
 target_fit:
-  version: mini_decoder_fit_v1
+  version: mini_decoder_fit_v2_af2_rigid_groups
   required: true
   max_steps: 1200
   canonical_ca_rmsd_max: 0.75

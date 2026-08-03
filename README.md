@@ -296,6 +296,12 @@ slow gate、locked validation 和最终 Lasso 评价都必须调用同一个 `st
 
 `patch.md` records the current correctness remediation and measured gate status.
 Production training now requires an offline, content-addressed decoder-fit cache.
+The cache uses the checked-in SimpleFold AlphaFold/OpenFold-style rigid-group
+constants for Atom14 reconstruction; raw PDB Atom14 coordinates remain evaluation
+references, while training receives the fitted decoder-manifold Atom14 coordinates.
+Cache convergence is fail-closed: both core and full-Atom14 strict checks, CA RMSD,
+and true lDDT must pass. The cache version is
+`mini_decoder_fit_v2_af2_rigid_groups`.
 Raw strict-invalid PDB targets and missing/non-converged fit entries are rejected.
 Build a focused cache and produce real per-rank metrics with:
 

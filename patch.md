@@ -43,6 +43,38 @@ preflight output are not release evidence.
 
 The strict evaluator source and thresholds were not changed by this patch.
 
+## Atom14 rigid-group correction
+
+The previous generic Atom14 route has been replaced by
+`lassodiff.af2_rigid_group`, which consumes the repository's checked-in
+AlphaFold/OpenFold-style residue constants from SimpleFold: residue-specific
+atom14 names, rigid-group frames, local positions, chi axes, aromatic and
+branched geometry, proline closure, and symmetry metadata. The production path
+no longer uses the legacy `_build_one()` approximation.
+
+For Lasso acceptors, `ASP_ISO` removes OD2 and lets the core own CG/OD1; the
+equivalent `GLU_ISO` route removes OE2 and lets chi geometry own CG while the
+core owns CD/OE1. Acceptor chi therefore changes the actual reactive atoms.
+
+Decoder-fit v2 (`mini_decoder_fit_v2_af2_rigid_groups`) optimizes against the
+canonical core plus local and symmetry-aware Atom14 losses and an element-aware
+covalent clash term. A fit is converged only when both core and full-Atom14
+strict checks pass, canonical CA RMSD is below 0.75 A, and true lDDT exceeds
+0.95. The grouped dataset stores the fitted Atom14 as training supervision and
+keeps raw PDB Atom14 in separate evaluation-only fields.
+
+The new route was checked with:
+
+```text
+mini_v2 fast tests: 55 passed, 1 deselected
+AF2 rigid-group/manifold tests: 5 passed
+```
+
+A short 300-step real LP_14506 fit produced full-Atom14 strict PASS but
+CA RMSD 0.786 A and lDDT 0.885, so it was correctly marked non-converged and
+was not eligible for production cache use. This is an honest gate result, not
+a release claim; a complete cache must be rebuilt with the full fit budget.
+
 ## Acceptance gates
 
 The following must be measured, not inferred:

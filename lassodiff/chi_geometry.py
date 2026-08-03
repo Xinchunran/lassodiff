@@ -7,6 +7,7 @@ import math
 import torch
 
 from .atom_schema_lasso import ATOM_C, ATOM_CA, ATOM_CB, ATOM_N, ATOM_O
+from .af2_rigid_group import build_atom14_from_af2_rigid_groups
 from .residue_constants_mini import CHI_ATOMS, SIDECHAIN_PARENT, SYMMETRIC_ATOM_PAIRS, padded_atom14_names
 
 
@@ -96,40 +97,36 @@ def build_atom14_from_rigid_groups(backbone_core: torch.Tensor, aa_ids: torch.Te
         squeeze = False
     B, L = aa_ids.shape
     outputs, masks = [], []
-    alphabet = "ACDEFGHIKLMNPQRSTVWY"
-    for batch, candidate in enumerate(candidates if isinstance(candidates, (list, tuple)) else [candidates]):
-        sequence = candidate.sequence
-        names = padded_atom14_names(sequence, candidate.k)
-        mask = torch.tensor([[bool(name) for name in row] for row in names], dtype=torch.bool, device=backbone_core.device)
-        rows = torch.stack([_build_one(backbone_core[batch, residue], aa, residue, names[residue], chi_angles[batch, residue], chi_masks[batch, residue])
-                            for residue, aa in enumerate(sequence)])
-        reactive_cg, _reactive_ciso, _reactive_oiso = _build_acceptor_reactive_group(
-            sequence=sequence,
-            core=backbone_core[batch],
-            acceptor_index=candidate.k,
-            chi=chi_angles[batch, candidate.k],
-            chi_mask=chi_masks[batch, candidate.k],
+    candidate_list = list(candidates) if isinstance(candidates, (list, tuple)) else [candidates]
+    for batch, candidate in enumerate(candidate_list):
+        rows, mask = build_atom14_from_af2_rigid_groups(
+            backbone_core[batch], candidate.sequence,
+            chi_angles[batch], chi_masks[batch], candidate,
         )
-        if sequence[candidate.k] == "D":
-            lookup = {name: slot for slot, name in enumerate(names[candidate.k]) if name}
-            ciso = backbone_core[batch, candidate.k, 5]
-            oiso = backbone_core[batch, candidate.k, 6]
-            use_reactive = ciso.norm() < 1e-6
-            ciso = torch.where(use_reactive, _reactive_ciso, ciso)
-            oiso = torch.where(use_reactive, _reactive_oiso, oiso)
-            rows[candidate.k, lookup["CG"]] = ciso
-            rows[candidate.k, lookup["OD1"]] = oiso
-        elif sequence[candidate.k] == "E":
-            lookup = {name: slot for slot, name in enumerate(names[candidate.k]) if name}
-            ciso = backbone_core[batch, candidate.k, 5]
-            oiso = backbone_core[batch, candidate.k, 6]
-            use_reactive = ciso.norm() < 1e-6
-            ciso = torch.where(use_reactive, _reactive_ciso, ciso)
-            oiso = torch.where(use_reactive, _reactive_oiso, oiso)
-            rows[candidate.k, lookup["CD"]] = ciso
-            rows[candidate.k, lookup["OE1"]] = oiso
-            rows[candidate.k, lookup["CG"]] = reactive_cg
-        outputs.append(rows); masks.append(mask)
+        # Unit and prior decoders may provide a core without reactive slots;
+        # in that case construct only the missing reactive group from chi.
+        # Production fitted cores always carry these slots and are not
+        # overwritten.
+        if backbone_core[batch, candidate.k, 5].norm() < 1e-6:
+            reactive_cg, reactive_ciso, reactive_oiso = _build_acceptor_reactive_group(
+                sequence=candidate.sequence,
+                core=backbone_core[batch],
+                acceptor_index=candidate.k,
+                chi=chi_angles[batch, candidate.k],
+                chi_mask=chi_masks[batch, candidate.k],
+            )
+            lookup = {name: slot for slot, name in enumerate(
+                padded_atom14_names(candidate.sequence, candidate.k)[candidate.k]
+            ) if name}
+            if candidate.sequence[candidate.k] == "D":
+                rows[candidate.k, lookup["CG"]] = reactive_ciso
+                rows[candidate.k, lookup["OD1"]] = reactive_oiso
+            else:
+                rows[candidate.k, lookup["CG"]] = reactive_cg
+                rows[candidate.k, lookup["CD"]] = reactive_ciso
+                rows[candidate.k, lookup["OE1"]] = reactive_oiso
+        outputs.append(rows)
+        masks.append(mask)
     result = torch.stack(outputs), torch.stack(masks)
     return (result[0][0], result[1][0]) if squeeze else result
 
@@ -150,18 +147,25 @@ def _build_acceptor_reactive_group(*, sequence: str, core: torch.Tensor,
         raise ValueError("core must be [L,7,3]")
     if chi.shape[-1] != 4 or chi_mask.shape[-1] != 4:
         raise ValueError("acceptor chi must have four padded slots")
-    residue = core[acceptor_index]
-    n, ca, cb = residue[ATOM_N], residue[ATOM_CA], residue[ATOM_CB]
-    def angle(index):
-        return chi[index] if bool(chi_mask[index]) else chi.new_tensor(0.0)
-    cg = _place(n, ca, cb, 1.520, math.radians(109.5), math.pi - angle(0))
+    # Use the same AF2 rigid-group constants as the Atom14 builder.  Keeping a
+    # second internal-coordinate implementation here would make CISO/CD drift
+    # away from the CG produced by the full-atom route.
+    all_chi = chi.new_zeros((len(sequence), 4))
+    all_mask = torch.zeros_like(all_chi, dtype=torch.bool)
+    all_chi[acceptor_index] = chi
+    all_mask[acceptor_index] = chi_mask
+    built, _ = build_atom14_from_af2_rigid_groups(
+        core, sequence, all_chi, all_mask, candidate=None,
+    )
+    names = padded_atom14_names(sequence)[acceptor_index]
+    lookup = {name: slot for slot, name in enumerate(names) if name}
+    cg = built[acceptor_index, lookup["CG"]]
     if aa == "D":
         ciso = cg
-        oiso = _place(ca, cb, ciso, 1.24, math.radians(120.8), math.pi - angle(1))
+        oiso = built[acceptor_index, lookup["OD1"]]
     else:
-        cd = _place(ca, cb, cg, 1.520, math.radians(109.5), math.pi - angle(1))
-        ciso = cd
-        oiso = _place(cb, cg, ciso, 1.24, math.radians(120.8), math.pi - angle(2))
+        ciso = built[acceptor_index, lookup["CD"]]
+        oiso = built[acceptor_index, lookup["OE1"]]
     return cg, ciso, oiso
 
 

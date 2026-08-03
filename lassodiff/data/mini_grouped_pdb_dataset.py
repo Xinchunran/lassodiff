@@ -152,11 +152,16 @@ class GroupedMiniPDBDataset(Dataset):
                 training_torsion_mask = torsion_mask if fit is None else fit.backbone_mask
                 training_chi = chi.angles[0, 0] if fit is None else fit.chi_angles
                 training_chi_mask = chi.masks[0, 0] if fit is None else fit.chi_mask
+                training_atom14 = atom14 if fit is None else fit.atom14_coordinates
+                training_atom14_mask = atom14_mask if fit is None else fit.atom14_mask
                 target_rows.append({
                     "record_id": record_id, "sequence": sequence, "k": candidate.k, "p": candidate.p,
                     "rank": rank, "target": str(selected.resolve()),
                     "core": training_core, "core_mask": parsed.core_atom_mask.bool(),
-                    "atom14": atom14, "atom14_mask": atom14_mask,
+                    # Production supervision is on the decoder manifold.  Keep
+                    # raw PDB coordinates separately for evaluation/audit only.
+                    "atom14": training_atom14, "atom14_mask": training_atom14_mask,
+                    "raw_atom14": atom14, "raw_atom14_mask": atom14_mask,
                     "backbone_torsions": training_torsions, "backbone_torsion_mask": training_torsion_mask,
                     "chi": training_chi, "chi_mask": training_chi_mask,
                     "loop_size": candidate.k + 1, "acceptor_from_pdb": int(next(iter(inferred))[0]),

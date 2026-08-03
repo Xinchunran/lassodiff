@@ -28,7 +28,7 @@ SIDECHAIN_PARENT = {
     "N": {"CG": "CB", "OD1": "CG", "ND2": "CG"}, "D": {"CG": "CB", "OD1": "CG", "OD2": "CG"},
     "C": {"SG": "CB"}, "Q": {"CG": "CB", "CD": "CG", "OE1": "CD", "NE2": "CD"},
     "E": {"CG": "CB", "CD": "CG", "OE1": "CD", "OE2": "CD"}, "G": {},
-    "H": {"CG": "CB", "ND1": "CG", "CD2": "CG", "CE1": "CD2", "NE2": "CE1"},
+    "H": {"CG": "CB", "ND1": "CG", "CD2": "CG", "CE1": "ND1", "NE2": "CD2"},
     "I": {"CG1": "CB", "CG2": "CB", "CD1": "CG1"}, "L": {"CG": "CB", "CD1": "CG", "CD2": "CG"},
     "K": {"CG": "CB", "CD": "CG", "CE": "CD", "NZ": "CE"}, "M": {"CG": "CB", "SD": "CG", "CE": "SD"},
     "F": {"CG": "CB", "CD1": "CG", "CD2": "CG", "CE1": "CD1", "CE2": "CD2", "CZ": "CE1"},

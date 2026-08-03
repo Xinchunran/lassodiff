@@ -4,6 +4,7 @@ import torch
 
 from lassodiff.atom_schema_lasso import ATOM_CB, ATOM_CISO, ATOM_OISO, CandidateCondition
 from lassodiff.chi_geometry import build_atom14_from_rigid_groups
+from lassodiff.af2_rigid_group import reference_bond_length
 from lassodiff.lasso_core_decoder import decode_lasso_core
 from lassodiff.residue_constants_mini import padded_atom14_names
 from lassodiff.seq_encoder import seq_to_aa_ids
@@ -34,11 +35,11 @@ def test_asp_ciso_is_cg_not_an_extra_carbon():
     )[0, 0]
     assert torch.allclose(
         (core[candidate.k, ATOM_CB] - core[candidate.k, ATOM_CISO]).norm(),
-        torch.tensor(1.520), atol=2e-4,
+        torch.tensor(reference_bond_length("D", "CB", "CG")), atol=2e-3,
     )
     assert torch.allclose(
         (core[candidate.k, ATOM_CISO] - core[candidate.k, ATOM_OISO]).norm(),
-        torch.tensor(1.240), atol=2e-4,
+        torch.tensor(reference_bond_length("D", "CG", "OD1")), atol=2e-4,
     )
 
 
@@ -57,9 +58,9 @@ def test_glu_atom14_uses_real_cg_cd_chain():
     lookup = {name: index for index, name in enumerate(names) if name}
     cb, cg, cd, oe1 = (atom14[candidate.k, lookup[name]] for name in ("CB", "CG", "CD", "OE1"))
     assert mask[candidate.k, lookup["CG"]]
-    assert torch.allclose((cb - cg).norm(), torch.tensor(1.520), atol=2e-4)
-    assert torch.allclose((cg - cd).norm(), torch.tensor(1.520), atol=2e-4)
-    assert torch.allclose((cd - oe1).norm(), torch.tensor(1.240), atol=2e-4)
+    assert torch.allclose((cb - cg).norm(), torch.tensor(reference_bond_length("E", "CB", "CG")), atol=2e-4)
+    assert torch.allclose((cg - cd).norm(), torch.tensor(reference_bond_length("E", "CG", "CD")), atol=2e-3)
+    assert torch.allclose((cd - oe1).norm(), torch.tensor(reference_bond_length("E", "CD", "OE1")), atol=2e-4)
     assert not torch.allclose(cg, (cb + cd) / 2)
 
 

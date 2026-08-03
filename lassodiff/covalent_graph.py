@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import torch
 
 from .residue_constants_mini import ELEMENTS, SIDECHAIN_PARENT, padded_atom14_names
+from .af2_rigid_group import reference_bond_length
 
 
 @dataclass
@@ -81,7 +82,10 @@ def atom14_bond_geometry(coordinates: torch.Tensor, mask: torch.Tensor, aa_ids: 
                     errors.append((coordinates[batch, residue, lookup[left]] - coordinates[batch, residue, lookup[right]]).norm() - expected[(left, right)])
             for atom, parent in SIDECHAIN_PARENT[aa].items():
                 if atom in lookup and parent in lookup and mask[batch, residue, lookup[atom]] and mask[batch, residue, lookup[parent]]:
-                    expected_side = 1.24 if residue == candidate.k and aa in "DE" and atom in {"OD1", "OE1"} else 1.52
+                    expected_side = (
+                        1.24 if residue == candidate.k and aa in "DE" and atom in {"OD1", "OE1"}
+                        else reference_bond_length(aa, parent, atom)
+                    )
                     errors.append((coordinates[batch, residue, lookup[atom]] - coordinates[batch, residue, lookup[parent]]).norm() - expected_side)
             if residue + 1 < len(candidate.sequence):
                 if mask[batch, residue, lookup["C"]] and mask[batch, residue + 1, {n: s for s, n in enumerate(names[residue + 1]) if n}["N"]]:

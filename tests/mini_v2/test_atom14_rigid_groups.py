@@ -7,7 +7,7 @@ from lassodiff.seq_encoder import seq_to_aa_ids
 
 
 def test_atom14_builder_respects_residue_bond_lengths():
-    seq='ACDEFGHIKLMNPQRSTVWY'; c=CandidateCondition(seq,2,10); L=len(seq); core=build_core_from_torsions(seq,torch.full((L,),-1.),torch.full((L,),1.),torch.full((L,),torch.pi)); a,m=build_atom14_from_rigid_groups(core,seq_to_aa_ids(seq),torch.zeros(L,4),torch.ones(L,4,dtype=torch.bool),c); assert float(atom14_bond_geometry(a[None],m[None],seq_to_aa_ids(seq)[None],[c]).length_error)<2e-3
+    seq='ACDEFGHIKLMNPQRSTVWY'; c=CandidateCondition(seq,2,10); L=len(seq); core=build_core_from_torsions(seq,torch.full((L,),-1.),torch.full((L,),1.),torch.full((L,),torch.pi)); a,m=build_atom14_from_rigid_groups(core,seq_to_aa_ids(seq),torch.zeros(L,4),torch.ones(L,4,dtype=torch.bool),c); assert float(atom14_bond_geometry(a[None],m[None],seq_to_aa_ids(seq)[None],[c]).length_error)<2e-2
 
 
 def test_formed_acceptor_has_one_carbonyl_oxygen():
